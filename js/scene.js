@@ -148,36 +148,43 @@ export function snapMeshToBed(mesh) {
   }
 }
 
-// 建立完整封頂、多階具備內部空腔的教學測試模型 (Manifold & Sealed)
+// 建立一體成型（無重疊面）、具備階梯頂面、懸空屋簷與頂部圓柱的教學模型
 export function createDemoGeometry() {
-  const shape = new THREE.Shape();
-  const w = 55, h = 45;
-  shape.moveTo(-w / 2, -h / 2);
-  shape.lineTo(w / 2, -h / 2);
-  shape.lineTo(w / 2, h / 2);
-  shape.lineTo(-w / 2, h / 2);
-  shape.closePath();
+  const geometries = [];
 
-  // 挖空內部以形成真實的殼體與填充空間
-  const hole = new THREE.Path();
-  const hw = 43, hh = 33;
-  hole.moveTo(-hw / 2, -hh / 2);
-  hole.lineTo(-hw / 2, hh / 2);
-  hole.lineTo(hw / 2, hh / 2);
-  hole.lineTo(hw / 2, -hh / 2);
-  hole.closePath();
-  shape.holes.push(hole);
+  // 第 1 層大底盤：Z = 0 ~ 10 mm (60 x 46 x 10)
+  const step1 = new THREE.BoxGeometry(60, 46, 10);
+  step1.translate(0, 0, 5);
+  geometries.push(step1);
 
-  const extrudeSettings = {
-    steps: 1,
-    depth: 32,
-    bevelEnabled: true,
-    bevelThickness: 1.5,
-    bevelSize: 1.5,
-    bevelSegments: 2
-  };
+  // 第 2 層階梯：Z = 10 ~ 20 mm (36 x 46 x 10)，右側留出 Z=10mm 的水平階梯頂面！
+  const step2 = new THREE.BoxGeometry(36, 46, 10);
+  step2.translate(-12, 0, 15);
+  geometries.push(step2);
 
-  const geometry = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-  geometry.rotateX(Math.PI / 2); // 轉正符合 Z 軸向上
-  return geometry;
+  // 第 3 層懸空屋頂：Z = 20 ~ 26 mm (54 x 34 x 6)，向右懸空突出 18mm 用於練習支撐！
+  const roof = new THREE.BoxGeometry(54, 34, 6);
+  roof.translate(-3, 0, 23);
+  geometries.push(roof);
+
+  // 第 4 層頂部圓柱：Z = 26 ~ 34 mm (半徑 9mm，高 8mm)
+  const cyl = new THREE.CylinderGeometry(9, 9, 8, 32);
+  cyl.rotateX(Math.PI / 2);
+  cyl.translate(-12, 0, 30);
+  geometries.push(cyl);
+
+  const positions = [];
+  for (const g of geometries) {
+    const nonIdx = g.index ? g.toNonIndexed() : g;
+    const posAttr = nonIdx.attributes.position;
+    for (let i = 0; i < posAttr.count; i++) {
+      positions.push(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
+    }
+    g.dispose();
+  }
+
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  out.computeVertexNormals();
+  return out;
 }

@@ -8,6 +8,9 @@ const PATTERN_LABELS = {
   rectilinear: '直線 (Rectilinear)'
 };
 
+// 共用單位方塊幾何體（中心在 0,0,0，長寬高皆為 1），供 InstancedMesh 高速渲染所有立體膠條
+const UNIT_EXTRUSION_GEO = new THREE.BoxGeometry(1, 1, 1);
+
 export function sliceMesh(modelMesh, cfg) {
   modelMesh.updateMatrixWorld(true);
 
@@ -18,6 +21,7 @@ export function sliceMesh(modelMesh, cfg) {
 
   const triCount = Math.floor(posAttr.count / 3);
   const tris = [];
+  const flatZTris = []; // 專門收集接近水平的頂面/底面三角形，用於判斷每個階梯的封頂與封底！
   const box = new THREE.Box3();
 
   const vA = new THREE.Vector3();
@@ -41,26 +45,44 @@ export function sliceMesh(modelMesh, cfg) {
     const zMin = Math.min(vA.z, vB.z, vC.z);
     const zMax = Math.max(vA.z, vB.z, vC.z);
 
-    tris.push({ a: vA.clone(), b: vB.clone(), c: vC.clone(), zMin, zMax });
+    cb.subVectors(vC, vB);
+    ab.subVectors(vA, vB);
+    cb.cross(ab).normalize();
 
-    if (cfg.supportEnable && zMin > 1.5) {
-      cb.subVectors(vC, vB);
-      ab.subVectors(vA, vB);
-      cb.cross(ab).normalize();
-      if (cb.z < -cosThreshold) {
-        overhangPoints.push({
-          x: (vA.x + vB.x + vC.x) / 3,
-          y: (vA.y + vB.y + vC.y) / 3,
-          z: (vA.z + vB.z + vC.z) / 3
-        });
-      }
+    const triObj = {
+      a: vA.clone(),
+      b: vB.clone(),
+      c: vC.clone(),
+      zMin,
+      zMax,
+      nz: cb.z,
+      minX: Math.min(vA.x, vB.x, vC.x),
+      maxX: Math.max(vA.x, vB.x, vC.x),
+      minY: Math.min(vA.y, vB.y, vC.y),
+      maxY: Math.max(vA.y, vB.y, vC.y)
+    };
+    tris.push(triObj);
+
+    // 若法向量 Z 分量絕對值 > 0.35，代表是頂面、底面或斜面，納入封頂/封底投影檢測
+    if (Math.abs(cb.z) > 0.35) {
+      flatZTris.push(triObj);
+    }
+
+    // 偵測懸空面以生成支撐
+    if (cfg.supportEnable && zMin > 1.5 && cb.z < -cosThreshold) {
+      overhangPoints.push({
+        x: (vA.x + vB.x + vC.x) / 3,
+        y: (vA.y + vB.y + vC.y) / 3,
+        z: (vA.z + vB.z + vC.z) / 3
+      });
     }
   }
 
+  // 計算各層切片 Z 座標（避開整數邊界 0.003mm，防止切平面剛好貼在水平階梯面上產生重疊）
   const maxZ = Math.max(0.4, box.max.z);
   const layerZs = [];
   let currentZ = cfg.initialLayerHeight;
-  while (currentZ <= maxZ + 0.001) {
+  while (currentZ <= maxZ - 0.02) {
     layerZs.push(Number(currentZ.toFixed(3)));
     currentZ += cfg.layerHeight;
   }
@@ -70,8 +92,8 @@ export function sliceMesh(modelMesh, cfg) {
   const previewGroup = new THREE.Group();
   const layerGroups = [];
 
-  // 賦予 3D 擠出線條真實厚度的材質與光影表現
-  const matConfig = { roughness: 0.3, metalness: 0.1 };
+  // Bambu Studio 標準材質（具備立體光澤）
+  const matConfig = { roughness: 0.35, metalness: 0.08 };
   const matOuterWall = new THREE.MeshStandardMaterial({ color: 0xff7b24, ...matConfig });
   const matInnerWall = new THREE.MeshStandardMaterial({ color: 0xffd026, ...matConfig });
   const matInfill = new THREE.MeshStandardMaterial({ color: 0xd9383a, ...matConfig });
@@ -79,11 +101,12 @@ export function sliceMesh(modelMesh, cfg) {
   const matSupport = new THREE.MeshStandardMaterial({ color: 0x23d160, ...matConfig });
   const matBrim = new THREE.MeshStandardMaterial({ color: 0x2b8cff, ...matConfig });
 
+  // 支撐柱格點合併
   const supportColumns = new Map();
   if (cfg.supportEnable && overhangPoints.length > 0) {
     for (const pt of overhangPoints) {
-      const gx = Math.round(pt.x / 4) * 4;
-      const gy = Math.round(pt.y / 4) * 4;
+      const gx = Math.round(pt.x / 4.5) * 4.5;
+      const gy = Math.round(pt.y / 4.5) * 4.5;
       const key = `${gx},${gy}`;
       if (!supportColumns.has(key) || supportColumns.get(key).z < pt.z) {
         supportColumns.set(key, { x: gx, y: gy, z: pt.z });
@@ -92,9 +115,13 @@ export function sliceMesh(modelMesh, cfg) {
   }
 
   let totalExtrusionLengthMM = 0;
+  const topShellThicknessZ = cfg.topLayers * cfg.layerHeight + 0.05;
+  const bottomShellThicknessZ = cfg.bottomLayers * cfg.layerHeight + 0.05;
 
+  // 逐層切片
   for (let lIdx = 0; lIdx < totalLayers; lIdx++) {
     const z = layerZs[lIdx];
+    const zSafe = z + 0.0037; // 微調避開整數高度奇異點
     const layerObj = new THREE.Group();
 
     const outerSegments = [];
@@ -106,69 +133,150 @@ export function sliceMesh(modelMesh, cfg) {
 
     let minX = Infinity, maxX = -Infinity;
     let minY = Infinity, maxY = -Infinity;
-    let sumX = 0, sumY = 0, segCount = 0;
+    let segCount = 0;
 
+    // 1. 取得該層所有三角形與 Z 平面的交線（外牆）
     for (let t = 0; t < tris.length; t++) {
       const tri = tris[t];
-      if (z < tri.zMin || z > tri.zMax) continue;
+      if (zSafe < tri.zMin || zSafe > tri.zMax) continue;
 
-      const pts = intersectTriangleZ(tri.a, tri.b, tri.c, z);
+      const pts = intersectTriangleZ(tri.a, tri.b, tri.c, zSafe);
       if (pts.length === 2) {
         const p1 = pts[0], p2 = pts[1];
-        outerSegments.push({ x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y });
-        totalExtrusionLengthMM += Math.hypot(p2.x - p1.x, p2.y - p1.y) * cfg.wallLoops;
+        const segLen = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        if (segLen < 0.02) continue;
+
+        outerSegments.push({
+          x1: p1.x,
+          y1: p1.y,
+          x2: p2.x,
+          y2: p2.y,
+          nx: tri.a ? -(p2.y - p1.y) / segLen : 0,
+          ny: tri.a ? (p2.x - p1.x) / segLen : 0
+        });
+        totalExtrusionLengthMM += segLen * cfg.wallLoops;
 
         minX = Math.min(minX, p1.x, p2.x);
         maxX = Math.max(maxX, p1.x, p2.x);
         minY = Math.min(minY, p1.y, p2.y);
         maxY = Math.max(maxY, p1.y, p2.y);
-        sumX += (p1.x + p2.x) * 0.5;
-        sumY += (p1.y + p2.y) * 0.5;
         segCount++;
       }
     }
 
-    const cx = segCount > 0 ? sumX / segCount : 0;
-    const cy = segCount > 0 ? sumY / segCount : 0;
+    const outerVertsForClip = [];
+    for (const s of outerSegments) {
+      outerVertsForClip.push(s.x1, s.y1, z, s.x2, s.y2, z);
+    }
 
+    // 2. 產生內牆（沿各線段法線向模型內部偏移，支援任意凹多邊形與多連通區域）
     if (!cfg.spiralVase && cfg.wallLoops > 1 && outerSegments.length > 0) {
       const loops = Math.min(cfg.wallLoops - 1, 5);
       for (let w = 1; w <= loops; w++) {
-        const inset = Math.max(0.75, 1 - w * 0.032);
+        const offsetDist = w * (cfg.lineWidth * 0.95);
         for (const seg of outerSegments) {
-          innerSegments.push({
-            x1: cx + (seg.x1 - cx) * inset,
-            y1: cy + (seg.y1 - cy) * inset,
-            x2: cx + (seg.x2 - cx) * inset,
-            y2: cy + (seg.y2 - cy) * inset
-          });
+          const mx = (seg.x1 + seg.x2) * 0.5;
+          const my = (seg.y1 + seg.y2) * 0.5;
+          // 判斷法線哪一側在多邊形內部
+          const testX = mx + seg.nx * 0.3;
+          const testY = my + seg.ny * 0.3;
+          const dir = isPointInPolygon(outerVertsForClip, testX, testY) ? 1 : -1;
+
+          const ox = seg.nx * offsetDist * dir;
+          const oy = seg.ny * offsetDist * dir;
+
+          // 退縮兩端點避免轉角突出模型外
+          const dx = seg.x2 - seg.x1;
+          const dy = seg.y2 - seg.y1;
+          const len = Math.hypot(dx, dy);
+          const shrink = Math.min(0.35, offsetDist / Math.max(1, len));
+
+          const sx1 = seg.x1 + dx * shrink + ox;
+          const sy1 = seg.y1 + dy * shrink + oy;
+          const sx2 = seg.x2 - dx * shrink + ox;
+          const sy2 = seg.y2 - dy * shrink + oy;
+
+          if (isPointInPolygon(outerVertsForClip, (sx1 + sx2) * 0.5, (sy1 + sy2) * 0.5)) {
+            innerSegments.push({ x1: sx1, y1: sy1, x2: sx2, y2: sy2 });
+          }
         }
       }
     }
 
-    const isShellLayer =
+    // 3. 內部區域：自動分辨「局部頂底封頂殼層（紫色）」與「內部稀疏填充（紅色）」
+    const isGlobalBottomOrTop =
       !cfg.spiralVase && (lIdx < cfg.bottomLayers || lIdx >= totalLayers - cfg.topLayers);
 
-    const outerVertsForClip = [];
-    for (const s of outerSegments) outerVertsForClip.push(s.x1, s.y1, z, s.x2, s.y2, z);
+    if (segCount > 0 && isFinite(minX) && !cfg.spiralVase) {
+      const wallInset = cfg.wallLoops * cfg.lineWidth * 0.9;
+      const shellStep = cfg.lineWidth * 1.45;
+      const shellAngle = lIdx % 2 === 0 ? Math.PI / 4 : -Math.PI / 4;
 
-    if (segCount > 0 && isFinite(minX)) {
-      if (isShellLayer) {
-        const shellStep = cfg.lineWidth * 2.3;
-        const angle = lIdx % 2 === 0 ? 0 : Math.PI / 2;
-        const len = generateRotatedHatchSegments(
-          outerVertsForClip, minX, maxX, minY, maxY, shellStep, angle, shellSegments
+      if (isGlobalBottomOrTop) {
+        // 整體最底層與最頂層：全區實心紫色封頂
+        totalExtrusionLengthMM += generateRotatedHatchSegments(
+          outerVertsForClip, minX, maxX, minY, maxY, shellStep, shellAngle, wallInset, shellSegments
         );
-        totalExtrusionLengthMM += len;
-      } else if (cfg.infillDensity > 0 && !cfg.spiralVase) {
-        const spacing = Math.max(2.2, 22 * (1 - cfg.infillDensity / 112));
-        const len = generatePatternInfillSegments(
-          cfg.infillPattern, outerVertsForClip, minX, maxX, minY, maxY, lIdx, spacing, infillSegments
+      } else {
+        // 中間層：檢查是否有「局部階梯頂面／懸空底面」需要紫色封頂！
+        const localShellCandidates = [];
+        generateRotatedHatchSegments(
+          outerVertsForClip, minX, maxX, minY, maxY, shellStep, shellAngle, wallInset, localShellCandidates
         );
-        totalExtrusionLengthMM += len;
+
+        // 將局部掃描線切分為小段，若正上方或正下方有水平面（距離 <= 頂底殼層厚度），就封頂為紫色殼層！
+        for (const cand of localShellCandidates) {
+          const length = Math.hypot(cand.x2 - cand.x1, cand.y2 - cand.y1);
+          const steps = Math.max(1, Math.ceil(length / 3.0));
+          for (let s = 0; s < steps; s++) {
+            const t0 = s / steps;
+            const t1 = (s + 1) / steps;
+            const x1 = cand.x1 + (cand.x2 - cand.x1) * t0;
+            const y1 = cand.y1 + (cand.y2 - cand.y1) * t0;
+            const x2 = cand.x1 + (cand.x2 - cand.x1) * t1;
+            const y2 = cand.y1 + (cand.y2 - cand.y1) * t1;
+            const mx = (x1 + x2) * 0.5;
+            const my = (y1 + y2) * 0.5;
+
+            if (isNearTopOrBottomSurface(flatZTris, mx, my, z, topShellThicknessZ, bottomShellThicknessZ)) {
+              shellSegments.push({ x1, y1, x2, y2 });
+              totalExtrusionLengthMM += Math.hypot(x2 - x1, y2 - y1);
+            }
+          }
+        }
+
+        // 其餘真正位於模型內部的空間：生成選定的稀疏填充圖案（蜂巢／陀螺儀／網格等）
+        if (cfg.infillDensity > 0) {
+          const spacing = Math.max(2.4, 22 * (1 - cfg.infillDensity / 112));
+          const rawInfill = [];
+          generatePatternInfillSegments(
+            cfg.infillPattern,
+            outerVertsForClip,
+            minX,
+            maxX,
+            minY,
+            maxY,
+            z,
+            lIdx,
+            spacing,
+            wallInset,
+            rawInfill
+          );
+
+          // 過濾掉已經鋪了紫色局部封頂的區域，避免紅紫重疊
+          for (const seg of rawInfill) {
+            const mx = (seg.x1 + seg.x2) * 0.5;
+            const my = (seg.y1 + seg.y2) * 0.5;
+            if (!isNearTopOrBottomSurface(flatZTris, mx, my, z, topShellThicknessZ, bottomShellThicknessZ)) {
+              infillSegments.push(seg);
+              totalExtrusionLengthMM += Math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1);
+            }
+          }
+        }
       }
     }
 
+    // 4. 支撐結構
     if (cfg.supportEnable && supportColumns.size > 0) {
       const isTree = cfg.supportType.includes('tree');
       supportColumns.forEach((col) => {
@@ -185,6 +293,7 @@ export function sliceMesh(modelMesh, cfg) {
       });
     }
 
+    // 5. 第一層裙邊 (Brim)
     if (lIdx === 0 && cfg.brimType !== 'no_brim' && cfg.brimWidth > 0 && isFinite(minX)) {
       const rings = Math.min(8, Math.max(2, Math.round(cfg.brimWidth / 0.8)));
       for (let r = 1; r <= rings; r++) {
@@ -201,13 +310,14 @@ export function sliceMesh(modelMesh, cfg) {
       }
     }
 
-    // 將所有線段以具備真實厚度的 3D 擠出網格（Mesh）加入場景
-    addThickSegmentsToGroup(layerObj, outerSegments, z, cfg.lineWidth, matOuterWall);
-    addThickSegmentsToGroup(layerObj, innerSegments, z, cfg.lineWidth * 0.9, matInnerWall);
-    addThickSegmentsToGroup(layerObj, infillSegments, z, cfg.lineWidth * 0.85, matInfill);
-    addThickSegmentsToGroup(layerObj, shellSegments, z, cfg.lineWidth * 0.9, matTopBottom);
-    addThickSegmentsToGroup(layerObj, supportSegments, z, cfg.lineWidth * 0.9, matSupport);
-    addThickSegmentsToGroup(layerObj, brimSegments, z, cfg.lineWidth, matBrim);
+    // 使用 InstancedMesh 繪製所有具有真實寬度與層高厚度的 3D 擠出膠條
+    const h = cfg.layerHeight * 0.92;
+    addInstancedExtrusions(layerObj, outerSegments, z, cfg.lineWidth, h, matOuterWall);
+    addInstancedExtrusions(layerObj, innerSegments, z, cfg.lineWidth * 0.9, h, matInnerWall);
+    addInstancedExtrusions(layerObj, infillSegments, z, cfg.lineWidth * 0.85, h, matInfill);
+    addInstancedExtrusions(layerObj, shellSegments, z, cfg.lineWidth * 0.95, h, matTopBottom);
+    addInstancedExtrusions(layerObj, supportSegments, z, cfg.lineWidth * 0.85, h, matSupport);
+    addInstancedExtrusions(layerObj, brimSegments, z, cfg.initialLineWidth, h, matBrim);
 
     layerGroups.push(layerObj);
     previewGroup.add(layerObj);
@@ -233,88 +343,96 @@ export function sliceMesh(modelMesh, cfg) {
   };
 }
 
-// 關鍵核心：將每一條 2D 路徑轉換為帶有寬度與高度的 3D 實心擠出方塊（BoxGeometry），創造厚度並解決穿透
-function addThickSegmentsToGroup(group, segments, z, thickness, material) {
+// 使用 THREE.InstancedMesh 零破圖、高速建立 3D 立體擠出線條
+function addInstancedExtrusions(group, segments, z, width, height, material) {
   if (!segments || segments.length === 0) return;
 
-  const geometries = [];
-  const halfT = Math.max(0.12, thickness * 0.5);
-  const layerH = 0.19; // 模擬擠出層高厚度
+  const validSegs = [];
+  for (const s of segments) {
+    const len = Math.hypot(s.x2 - s.x1, s.y2 - s.y1);
+    if (len >= 0.05) validSegs.push({ ...s, len });
+  }
+  if (validSegs.length === 0) return;
 
-  for (const seg of segments) {
-    const dx = seg.x2 - seg.x1;
-    const dy = seg.y2 - seg.y1;
-    const len = Math.hypot(dx, dy);
-    if (len < 0.01) continue;
+  const instMesh = new THREE.InstancedMesh(UNIT_EXTRUSION_GEO, material, validSegs.length);
+  const dummy = new THREE.Object3D();
+  const zCenter = z - height * 0.5;
 
-    const boxGeo = new THREE.BoxGeometry(len, thickness, layerH);
+  for (let i = 0; i < validSegs.length; i++) {
+    const seg = validSegs[i];
     const mx = (seg.x1 + seg.x2) * 0.5;
     const my = (seg.y1 + seg.y2) * 0.5;
-    const mz = z + layerH * 0.5;
+    const angle = Math.atan2(seg.y2 - seg.y1, seg.x2 - seg.x1);
 
-    boxGeo.translate(len * 0.5, 0, 0);
-    const angle = Math.atan2(dy, dx);
-    boxGeo.rotateZ(angle);
-    boxGeo.translate(mx, my, mz);
-    geometries.push(boxGeo);
+    dummy.position.set(mx, my, zCenter);
+    dummy.rotation.set(0, 0, angle);
+    // 長度稍微加寬 0.15mm 讓線段轉角處自然接合不留縫隙
+    dummy.scale.set(seg.len + width * 0.35, width, height);
+    dummy.updateMatrix();
+    instMesh.setMatrixAt(i, dummy.matrix);
   }
 
-  if (geometries.length > 0) {
-    const mergedGeo = mergeBufferGeometriesSafe(geometries);
-    const mesh = new THREE.Mesh(mergedGeo, material);
-    group.add(mesh);
-  }
+  instMesh.instanceMatrix.needsUpdate = true;
+  group.add(instMesh);
 }
 
-function mergeBufferGeometriesSafe(geos) {
-  const positions = [];
-  const normals = [];
-  const uvs = [];
+// 檢查點 (px, py, z) 正上方或正下方是否緊鄰模型的水平/傾斜頂面或底面（解決階梯平台沒封頂問題）
+function isNearTopOrBottomSurface(flatZTris, px, py, z, topThick, bottomThick) {
+  for (let i = 0; i < flatZTris.length; i++) {
+    const t = flatZTris[i];
+    if (px < t.minX || px > t.maxX || py < t.minY || py > t.maxY) continue;
 
-  for (const g of geos) {
-    const pos = g.attributes.position;
-    const norm = g.attributes.normal;
-    const uv = g.attributes.uv;
-    for (let i = 0; i < pos.count; i++) {
-      positions.push(pos.getX(i), pos.getY(i), pos.getZ(i));
-      if (norm) normals.push(norm.getX(i), norm.getY(i), norm.getZ(i));
-      if (uv) uvs.push(uv.getX(i), uv.getY(i));
+    // 檢查是否為正上方的頂蓋面 (nz > 0.35)
+    if (t.nz > 0.35 && t.zMax >= z - 0.05 && t.zMin <= z + topThick) {
+      if (pointInTri2D(px, py, t.a, t.b, t.c)) return true;
     }
-    g.dispose();
+    // 檢查是否為正下方的底面 (nz < -0.35)
+    if (t.nz < -0.35 && t.zMin <= z + 0.05 && t.zMax >= z - bottomThick) {
+      if (pointInTri2D(px, py, t.a, t.b, t.c)) return true;
+    }
   }
-
-  const out = new THREE.BufferGeometry();
-  out.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  if (normals.length > 0) out.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-  if (uvs.length > 0) out.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-  return out;
+  return false;
 }
 
-function generatePatternInfillSegments(pattern, outerVerts, minX, maxX, minY, maxY, lIdx, spacing, outSegs) {
+function pointInTri2D(px, py, a, b, c) {
+  const d1 = (px - b.x) * (a.y - b.y) - (a.x - b.x) * (py - b.y);
+  const d2 = (px - c.x) * (b.y - c.y) - (b.x - c.x) * (py - c.y);
+  const d3 = (px - a.x) * (c.y - a.y) - (c.x - a.x) * (py - a.y);
+  const hasNeg = d1 < -0.001 || d2 < -0.001 || d3 < -0.001;
+  const hasPos = d1 > 0.001 || d2 > 0.001 || d3 > 0.001;
+  return !(hasNeg && hasPos);
+}
+
+// ============================================================================
+// 5 種真實幾何填充圖案產生器
+// ============================================================================
+function generatePatternInfillSegments(
+  pattern, outerVerts, minX, maxX, minY, maxY, z, lIdx, spacing, wallInset, outSegs
+) {
   if (pattern === 'honeycomb') {
     return generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, outSegs);
   } else if (pattern === 'gyroid') {
-    return generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, spacing, outSegs);
+    return generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, outSegs);
   } else if (pattern === 'triangles') {
     let len = 0;
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 1.15, 0, outSegs);
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 1.15, Math.PI / 3, outSegs);
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 1.15, (2 * Math.PI) / 3, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 1.15, 0, wallInset, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 1.15, Math.PI / 3, wallInset, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 1.15, (2 * Math.PI) / 3, wallInset, outSegs);
     return len;
   } else if (pattern === 'rectilinear') {
     const angle = lIdx % 2 === 0 ? Math.PI / 4 : -Math.PI / 4;
-    return generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 0.85, angle, outSegs);
+    return generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 0.85, angle, wallInset, outSegs);
   } else {
     let len = 0;
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, 0, outSegs);
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, Math.PI / 2, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, 0, wallInset, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, Math.PI / 2, wallInset, outSegs);
     return len;
   }
 }
 
 function generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, outSegs) {
   let addedLength = 0;
-  const R = Math.max(2.0, spacing * 0.65);
+  const R = Math.max(2.2, spacing * 0.65);
   const dx = R * 1.5;
   const dy = R * Math.sqrt(3);
 
@@ -343,18 +461,19 @@ function generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, 
   return addedLength;
 }
 
-function generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, spacing, outSegs) {
+function generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, outSegs) {
   let addedLength = 0;
-  const waveStep = Math.max(2.5, spacing * 0.95);
-  const amp = waveStep * 0.38;
+  const waveStep = Math.max(2.6, spacing * 0.95);
+  const amp = waveStep * 0.36;
   const freq = (2 * Math.PI) / (waveStep * 2.2);
-  const segStep = 1.6;
+  const phaseZ = z * 0.65;
+  const segStep = 1.8;
 
   for (let baseY = minY; baseY <= maxY; baseY += waveStep) {
     let prevX = minX;
-    let prevY = baseY + Math.sin(prevX * freq) * amp;
+    let prevY = baseY + Math.sin(prevX * freq + phaseZ) * amp;
     for (let x = minX + segStep; x <= maxX; x += segStep) {
-      const curY = baseY + Math.sin(x * freq) * amp;
+      const curY = baseY + Math.sin(x * freq + phaseZ) * amp;
       const mx = (prevX + x) * 0.5;
       const my = (prevY + curY) * 0.5;
       if (isPointInPolygon(outerVerts, mx, my)) {
@@ -365,10 +484,28 @@ function generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, spacing, out
       prevY = curY;
     }
   }
+
+  for (let baseX = minX; baseX <= maxX; baseX += waveStep) {
+    let prevY = minY;
+    let prevX = baseX + Math.cos(prevY * freq - phaseZ) * amp;
+    for (let y = minY + segStep; y <= maxY; y += segStep) {
+      const curX = baseX + Math.cos(y * freq - phaseZ) * amp;
+      const mx = (prevX + curX) * 0.5;
+      const my = (prevY + y) * 0.5;
+      if (isPointInPolygon(outerVerts, mx, my)) {
+        outSegs.push({ x1: prevX, y1: prevY, x2: curX, y2: y });
+        addedLength += Math.hypot(curX - prevX, y - prevY);
+      }
+      prevY = y;
+      prevX = curX;
+    }
+  }
   return addedLength;
 }
 
-function generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, angleRad, outSegs) {
+function generateRotatedHatchSegments(
+  outerVerts, minX, maxX, minY, maxY, spacing, angleRad, insetMargin, outSegs
+) {
   let addedLength = 0;
   const cosA = Math.cos(-angleRad);
   const sinA = Math.sin(-angleRad);
@@ -401,8 +538,8 @@ function generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacin
 
     uHits.sort((a, b) => a - b);
     for (let k = 0; k + 1 < uHits.length; k += 2) {
-      const ua = uHits[k] + 0.35;
-      const ub = uHits[k + 1] - 0.35;
+      const ua = uHits[k] + insetMargin;
+      const ub = uHits[k + 1] - insetMargin;
       if (ub > ua) {
         const x1 = cx + ua * cosInv - v * sinInv;
         const y1 = cy + ua * sinInv + v * cosInv;

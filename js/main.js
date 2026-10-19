@@ -119,8 +119,7 @@ function runSlicer() {
   if (state.slicePreviewGroup) {
     scene.remove(state.slicePreviewGroup);
     state.slicePreviewGroup.traverse((obj) => {
-      if (obj.geometry) obj.geometry.dispose();
-      if (obj.material) obj.material.dispose();
+      if (obj.geometry && obj.geometry.dispose) obj.geometry.dispose();
     });
   }
 
@@ -134,12 +133,11 @@ function runSlicer() {
   updatePreviewStatsUI();
   switchMode('preview');
 
-  // 若有頂部實心殼層，自動將預覽拉桿退開頂部殼層 4 層，讓學生直接看到內部的蜂巢/陀螺儀填充！
-  const inspectLayer = Math.max(1, result.totalLayers - cfg.topLayers - 2);
-  document.getElementById('layer-slider').value = inspectLayer;
-  filterVisibleLayers(inspectLayer);
+  // 預設顯示全部層數（完整封頂狀態），學生向下拉動拉桿即可剖開觀察內部填充
+  document.getElementById('layer-slider').value = result.totalLayers;
+  filterVisibleLayers(result.totalLayers);
 
-  showToast(`切片完成（${result.patternLabel}）！已自動剖開頂蓋方便觀察內部填充`);
+  showToast(`切片完成（${result.patternLabel}）！向下拖動右側拉桿即可剖開觀察內部填充`);
 }
 
 function updatePreviewStatsUI() {

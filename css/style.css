@@ -1,0 +1,156 @@
+:root {
+  --bambu-green: #00ae42;
+  --bambu-green-hover: #00c84c;
+  --bg-dark: #1e1e1e;
+  --bg-panel: #262626;
+  --bg-input: #333333;
+  --border-color: #3d3d3d;
+  --text-main: #e5e5e5;
+}
+
+body {
+  background-color: var(--bg-dark);
+  color: var(--text-main);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Microsoft JhengHei", sans-serif;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* 捲軸美化 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-panel);
+}
+::-webkit-scrollbar-thumb {
+  background: #4a4a4a;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #5a5a5a;
+}
+
+/* 輸入框與下拉選單 */
+.bambu-input {
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+  transition: border-color 0.15s;
+}
+.bambu-input:focus {
+  outline: none;
+  border-color: var(--bambu-green);
+}
+
+/* 參數區塊排版 */
+.section-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--bambu-green);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid #383838;
+  padding-bottom: 4px;
+}
+
+.param-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #d4d4d4;
+}
+
+.param-input-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.unit {
+  color: #737373;
+  width: 24px;
+}
+
+.unit-wide {
+  color: #737373;
+  width: 32px;
+}
+
+/* 座標輸入框 */
+.coord-box {
+  display: flex;
+  align-items: center;
+  background-color: #1e1e1e;
+  border-radius: 4px;
+  padding: 2px 6px;
+  border: 1px solid #3a3a3a;
+}
+.coord-box input {
+  width: 100%;
+  background: transparent;
+  text-align: right;
+  outline: none;
+}
+
+/* 分頁與模式切換按鈕 */
+.param-tab.active {
+  color: var(--bambu-green);
+  border-bottom: 2px solid var(--bambu-green);
+  background-color: rgba(0, 174, 66, 0.08);
+}
+
+.mode-btn.active {
+  background-color: var(--bambu-green);
+  color: white;
+  font-weight: 600;
+}
+
+/* 頂部工具按鈕 */
+.tool-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 10px;
+  border-radius: 4px;
+  color: #cfcfcf;
+  font-size: 11px;
+  gap: 3px;
+  transition: all 0.15s;
+}
+.tool-btn:hover:not(:disabled) {
+  background-color: #383838;
+  color: white;
+}
+.tool-btn.active {
+  background-color: rgba(0, 174, 66, 0.25);
+  color: var(--bambu-green);
+  border: 1px solid var(--bambu-green);
+}
+.tool-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 右側垂直層數拉桿 */
+input[type="range"].layer-slider {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  appearance: slider-vertical;
+  width: 8px;
+  height: 360px;
+  accent-color: var(--bambu-green);
+  cursor: pointer;
+}
+
+/* 拖曳檔案覆蓋層 */
+#drop-overlay {
+  background: rgba(0, 174, 66, 0.18);
+  border: 3px dashed var(--bambu-green);
+  backdrop-filter: blur(2px);
+}

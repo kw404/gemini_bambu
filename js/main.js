@@ -107,6 +107,7 @@ function readSlicerSettings() {
 }
 
 // 執行切片並切換至預覽
+// 請替換 js/main.js 中的 runSlicer 函式：
 function runSlicer() {
   if (!state.modelMesh) {
     alert('請先匯入模型或載入範例模型！');
@@ -133,12 +134,36 @@ function runSlicer() {
   updatePreviewStatsUI();
   switchMode('preview');
 
-  // 預設顯示全部層數（完整封頂狀態），學生向下拉動拉桿即可剖開觀察內部填充
   document.getElementById('layer-slider').value = result.totalLayers;
   filterVisibleLayers(result.totalLayers);
 
-  showToast(`切片完成（${result.patternLabel}）！向下拖動右側拉桿即可剖開觀察內部填充`);
+  // 檢查懸空與支撐狀態，若有懸空但沒開支撐，主動跳出類似 Bambu Studio 的警告提示！
+  if (result.overhangPointsCount > 5 && !cfg.supportEnable) {
+    showOverhangWarning(state.modelName);
+  } else {
+    showToast(`切片完成（${result.patternLabel}）！向下拖動右側拉桿即可觀察內部`);
+  }
 }
+
+// 模擬 Bambu Studio 的浮空懸臂警告提示條
+function showOverhangWarning(modelName) {
+  const existingAlert = document.getElementById('overhang-alert-box');
+  if (existingAlert) existingAlert.remove();
+
+  const alertBox = document.createElement('div');
+  alertBox.id = 'overhang-alert-box';
+  alertBox.className = 'absolute top-16 left-1/2 -translate-x-1/2 bg-[#d97706] border border-[#f59e0b] text-white text-xs px-4 py-3 rounded-lg shadow-2xl z-50 flex items-center gap-3 backdrop-blur';
+  alertBox.innerHTML = `
+    <i class="fa-solid fa-triangle-exclamation text-lg text-amber-200"></i>
+    <div>
+      <div class="font-bold">警告：</div>
+      <div>似乎物件 <b>${modelName}</b> 有浮空懸臂。請重新調整物件的方向或啟用支撐生成。</div>
+    </div>
+    <button onclick="this.parentElement.remove()" class="ml-4 text-amber-200 hover:text-white font-bold text-sm px-1.5 py-0.5 rounded">✕</button>
+  `;
+  document.getElementById('viewport-container').appendChild(alertBox);
+}
+
 
 function updatePreviewStatsUI() {
   const d = state.sliceData;

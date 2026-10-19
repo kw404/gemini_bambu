@@ -20,7 +20,7 @@ export function sliceMesh(modelMesh, cfg) {
 
   const triCount = Math.floor(posAttr.count / 3);
   const tris = [];
-  const nonVerticalTris = []; // 所有非垂直面（|nz| > 0.15），用於垂直射線穿刺配對
+  const nonVerticalTris = [];
   const box = new THREE.Box3();
 
   const vA = new THREE.Vector3();
@@ -33,7 +33,6 @@ export function sliceMesh(modelMesh, cfg) {
   let sideSurfaceAreaMM2 = 0;
   let flatTopBottomAreaMM2 = 0;
 
-  // 懸空角度門檻：面與水平面的傾斜程度 |nz| >= sin(thresholdAngle)
   const minOverhangAbsNz = Math.sin((Math.max(5, cfg.supportAngle) * Math.PI) / 180);
 
   for (let i = 0; i < triCount; i++) {
@@ -84,19 +83,19 @@ export function sliceMesh(modelMesh, cfg) {
   }
 
   const realMeshVolumeMM3 = Math.abs(signedVolumeSum);
+  const isTreeSupport =
+    cfg.supportEnable && (cfg.supportType.includes('tree') || cfg.supportStyle === 'organic');
 
   // ============================================================================
-  // 穩健垂直射線奇偶配對支撐偵測 (Even-Odd Ray-Slab Support Detection)
-  // 完全不依賴三角形法線正負號，對任何匯入模型或 ExtrudeGeometry 皆 100% 有效！
+  // 1. 偵測所有懸空支撐目標點 (Support Tips)
   // ============================================================================
   const supportSpans = [];
   let totalSupportHeightMM = 0;
 
   if (cfg.supportEnable && isFinite(box.min.x)) {
-    const gridStep = 3.5;
-    for (let gx = box.min.x + 1.6; gx <= box.max.x - 1.6; gx += gridStep) {
-      for (let gy = box.min.y + 1.6; gy <= box.max.y - 1.6; gy += gridStep) {
-        // 偏移 0.013mm 避免射線剛好打在兩個三角形的共用對角線上重複計算
+    const gridStep = isTreeSupport ? 4.2 : 3.6;
+    for (let gx = box.min.x + 1.8; gx <= box.max.x - 1.8; gx += gridStep) {
+      for (let gy = box.min.y + 1.8; gy <= box.max.y - 1.8; gy += gridStep) {
         const rx = gx + 0.013;
         const ry = gy + 0.017;
 
@@ -113,7 +112,6 @@ export function sliceMesh(modelMesh, cfg) {
 
         rawHits.sort((a, b) => a.z - b.z);
 
-        // 合併距離小於 0.15mm 的同高度交點
         const uniqueHits = [rawHits[0]];
         for (let i = 1; i < rawHits.length; i++) {
           if (rawHits[i].z - uniqueHits[uniqueHits.length - 1].z > 0.15) {
@@ -121,22 +119,17 @@ export function sliceMesh(modelMesh, cfg) {
           }
         }
 
-        // 在水密網格中，由下往上穿刺的交點兩兩配對為實體區間：[z_0, z_1], [z_2, z_3]...
-        // 其中偶數索引 k = 0, 2, 4... 是「進入模型實體的底面 (Bottom/Overhang Surface)」
-        // 奇數索引 k = 1, 3, 5... 是「離開模型實體的頂面 (Top Surface)」
         for (let k = 0; k < uniqueHits.length; k += 2) {
           const enterHit = uniqueHits[k];
           const zTop = enterHit.z;
 
-          // 若該進入底面高度 > 1.2mm（懸空於半空中），且傾斜角滿足支撐條件
           if (zTop > 1.2 && enterHit.absNz >= minOverhangAbsNz) {
-            // 下方承接面：若是第一個實體區間 (k === 0)，下方就是 Z = 0 的 PEI 熱床！
-            // 若 k >= 2，下方承接面就是前一個實體區間的頂面 uniqueHits[k - 1].z
             const zBottom = k === 0 ? 0 : uniqueHits[k - 1].z;
 
             if (zTop - zBottom > 1.2) {
-              // 若勾選「僅在列印板生成 (On build plate only)」，則只生成 zBottom === 0 的支撐柱
-              if (cfg.supportBuildPlateOnly && zBottom > 0.6) continue;
+              // 注意：普通支撐若勾選「僅在列印板生成」會略過模型上方的點；
+              // 但原廠「樹狀支撐」會從列印板外圍長出斜向樹幹繞過模型去托住它！
+              if (!isTreeSupport && cfg.supportBuildPlateOnly && zBottom > 0.6) continue;
 
               supportSpans.push({
                 x: gx,
@@ -144,13 +137,18 @@ export function sliceMesh(modelMesh, cfg) {
                 zBottom,
                 zTop
               });
-              totalSupportHeightMM += zTop - zBottom;
+              totalSupportHeightMM += zTop - (isTreeSupport ? 0 : zBottom);
             }
           }
         }
       }
     }
   }
+
+  // ============================================================================
+  // 2. 若為樹狀支撐：建構「主樹幹 (Trunks) -> 中間分枝 (Forks) -> 頂部細枝 (Tips)」階層樹結構
+  // ============================================================================
+  const treeStructures = isTreeSupport ? buildOrganicTreeStructures(supportSpans, box, cfg) : [];
 
   const maxZ = Math.max(0.4, box.max.z);
   const layerZs = [];
@@ -170,7 +168,7 @@ export function sliceMesh(modelMesh, cfg) {
   const matInnerWall = new THREE.MeshStandardMaterial({ color: 0xffd026, ...matConfig });
   const matInfill = new THREE.MeshStandardMaterial({ color: 0xd9383a, ...matConfig });
   const matTopBottom = new THREE.MeshStandardMaterial({ color: 0x9a4dff, ...matConfig });
-  const matSupport = new THREE.MeshStandardMaterial({ color: 0x23d160, ...matConfig });
+  const matSupport = new THREE.MeshStandardMaterial({ color: 0x18b84e, ...matConfig });
   const matBrim = new THREE.MeshStandardMaterial({ color: 0x2b8cff, ...matConfig });
 
   const topShellThicknessZ = cfg.topLayers * cfg.layerHeight + 0.05;
@@ -327,37 +325,21 @@ export function sliceMesh(modelMesh, cfg) {
       }
     }
 
-    // 4. 支撐結構繪製
-    if (cfg.supportEnable && supportSpans.length > 0) {
-      const isTree = cfg.supportType.includes('tree') || cfg.supportStyle === 'organic';
-
-      for (let s = 0; s < supportSpans.length; s++) {
-        const sp = supportSpans[s];
-        if (z > sp.zBottom + 0.05 && z < sp.zTop - cfg.layerHeight * 0.5) {
-          // 避免畫入同高度的模型實體內部
-          if (outerVertsForClip.length > 0 && isPointInPolygon(outerVertsForClip, sp.x, sp.y)) {
-            continue;
-          }
-
-          const progress = (z - sp.zBottom) / Math.max(1, sp.zTop - sp.zBottom);
-
-          if (isTree) {
-            const radius = 1.9 * (1 - progress * 0.42);
-            const trunkShiftX = Math.sin(progress * Math.PI) * 0.6;
-            const cx = sp.x + trunkShiftX;
-            const cy = sp.y;
-            const sides = 6;
-            for (let k = 0; k < sides; k++) {
-              const a1 = (k * 2 * Math.PI) / sides;
-              const a2 = ((k + 1) * 2 * Math.PI) / sides;
-              supportSegments.push({
-                x1: cx + radius * Math.cos(a1),
-                y1: cy + radius * Math.sin(a1),
-                x2: cx + radius * Math.cos(a2),
-                y2: cy + radius * Math.sin(a2)
-              });
+    // ============================================================================
+    // 4. 支撐結構繪製：有機分岔樹狀支撐 (Organic Tree) vs 普通柱狀支撐 (Normal)
+    // ============================================================================
+    if (cfg.supportEnable) {
+      if (isTreeSupport && treeStructures.length > 0) {
+        // 繪製有機樹狀支撐在當前高度 Z 的所有圓管截面與底盤裙邊
+        generateOrganicTreeLayerSegments(treeStructures, z, lIdx, cfg, outerVertsForClip, supportSegments);
+      } else if (!isTreeSupport && supportSpans.length > 0) {
+        // 普通方格支撐 (Normal)
+        for (let s = 0; s < supportSpans.length; s++) {
+          const sp = supportSpans[s];
+          if (z > sp.zBottom + 0.05 && z < sp.zTop - cfg.layerHeight * 0.5) {
+            if (outerVertsForClip.length > 0 && isPointInPolygon(outerVertsForClip, sp.x, sp.y)) {
+              continue;
             }
-          } else {
             const r = 1.55;
             const isInterfaceLayer = z > sp.zTop - cfg.layerHeight * 3.2;
             if (isInterfaceLayer) {
@@ -401,7 +383,7 @@ export function sliceMesh(modelMesh, cfg) {
     addInstancedExtrusions(layerObj, innerSegments, z, cfg.lineWidth * 0.9, h, matInnerWall);
     addInstancedExtrusions(layerObj, infillSegments, z, cfg.lineWidth * 0.85, h, matInfill);
     addInstancedExtrusions(layerObj, shellSegments, z, cfg.lineWidth * 0.95, h, matTopBottom);
-    addInstancedExtrusions(layerObj, supportSegments, z, cfg.lineWidth * 0.88, h, matSupport);
+    addInstancedExtrusions(layerObj, supportSegments, z, cfg.lineWidth * 0.92, h, matSupport);
     addInstancedExtrusions(layerObj, brimSegments, z, cfg.initialLineWidth, h, matBrim);
 
     layerGroups.push(layerObj);
@@ -426,7 +408,7 @@ export function sliceMesh(modelMesh, cfg) {
     ? 0
     : interiorCoreVolume * (cfg.infillDensity / 100) * patternMultiplier;
 
-  const supportAreaPerCol = cfg.supportType.includes('tree') ? 2.4 : 3.1;
+  const supportAreaPerCol = isTreeSupport ? 2.1 : 3.1;
   const volSupport = cfg.supportEnable ? totalSupportHeightMM * supportAreaPerCol : 0;
   const volBrim = brimExtrusionMM * cfg.initialLineWidth * cfg.initialLayerHeight;
 
@@ -469,8 +451,241 @@ export function sliceMesh(modelMesh, cfg) {
     pctByType,
     patternLabel: PATTERN_LABELS[cfg.infillPattern] || cfg.infillPattern,
     hasSupportGenerated: supportSpans.length > 0,
+    overhangPointsCount: supportSpans.length, // 計算懸空點數量
     settings: cfg
   };
+}
+
+// ============================================================================
+// Bambu Studio 風格「有機樹狀支撐 (Organic Tree Support)」拓樸建構與曲線分枝引擎
+// ============================================================================
+function buildOrganicTreeStructures(supportSpans, modelBox, cfg) {
+  if (!supportSpans || supportSpans.length === 0) return [];
+
+  // 將頂部支撐點依照區塊 (約 13x11 mm) 聚類為一棵棵有機樹
+  const clusterMap = new Map();
+  const cellX = 12.0;
+  const cellY = 11.0;
+
+  for (const sp of supportSpans) {
+    // 區分「直接對熱床懸空」與「對階梯平台懸空」兩類群組
+    const overModel = sp.zBottom > 0.6;
+    const kx = Math.floor(sp.x / cellX);
+    const ky = Math.floor(sp.y / cellY);
+    const key = `${overModel ? 'M' : 'B'}_${kx}_${ky}`;
+
+    if (!clusterMap.has(key)) {
+      clusterMap.set(key, { overModel, tips: [] });
+    }
+    clusterMap.get(key).tips.push(sp);
+  }
+
+  const trees = [];
+
+  clusterMap.forEach((group) => {
+    const tips = group.tips;
+    if (tips.length === 0) return;
+
+    // 計算該樹冠頂部所有支撐點的中心與最高/最低點
+    let sumX = 0, sumY = 0, maxTopZ = 0, minBotZ = Infinity;
+    for (const t of tips) {
+      sumX += t.x;
+      sumY += t.y;
+      if (t.zTop > maxTopZ) maxTopZ = t.zTop;
+      if (t.zBottom < minBotZ) minBotZ = t.zBottom;
+    }
+    const crownX = sumX / tips.length;
+    const crownY = sumY / tips.length;
+
+    // 決定主樹幹根部 (Root) 的位置：
+    // 1. 若懸空區直接對著熱床 (zBottom === 0)，樹根就種在熱床上並稍微往外偏，形成自然彎曲弧度
+    // 2. 若懸空區下方有模型階梯擋住 (overModel === true)，模仿 Bambu Studio：
+    //    將樹根種在模型前後側面外圍的 PEI 熱床上 (Z = 0)，再斜向往上伸進懸空區！
+    let rootX = crownX;
+    let rootY = crownY;
+    let rootZ = 0;
+
+    if (group.overModel) {
+      if (cfg.supportBuildPlateOnly) {
+        // 從模型前後側外圍熱床 (Z = 0) 斜向長出大樹幹繞過第一階方塊（如同您截圖左側那根斜向大樹幹！）
+        const distToFront = Math.abs(crownY - modelBox.min.y);
+        const distToBack = Math.abs(modelBox.max.y - crownY);
+        const sideSign = distToFront <= distToBack ? -1 : 1;
+        const outsideY = sideSign < 0 ? modelBox.min.y - 5.5 : modelBox.max.y + 5.5;
+
+        rootX = crownX - 2.0;
+        rootY = outsideY;
+        rootZ = 0;
+      } else {
+        // 若取消勾選「僅在列印板生成」，允許樹根直接種在階梯平台上或外圍熱床
+        const distToFront = Math.abs(crownY - modelBox.min.y);
+        if (distToFront < 10) {
+          rootX = crownX - 1.5;
+          rootY = modelBox.min.y - 5.0;
+          rootZ = 0;
+        } else {
+          rootX = crownX;
+          rootY = crownY;
+          rootZ = minBotZ;
+        }
+      }
+    } else {
+      // 直接在熱床上方的懸空區：樹根落在 Z = 0，並稍微往外張開 2.5mm 呈現有機樹幹曲線
+      rootX = crownX + 2.2;
+      rootY = crownY + (crownY >= 0 ? 1.5 : -1.5);
+      rootZ = 0;
+    }
+
+    // 設定二級分岔高度：
+    // Z = rootZ ~ zFork1：單一粗主幹 (Main Trunk)
+    // Z = zFork1 ~ zFork2：分裂為 2~3 根中樹枝 (Sub-branches)
+    // Z = zFork2 ~ zTop：分裂為頂部密集小樹枝 (Twigs / Tips) 托住屋頂
+    const totalH = Math.max(4, maxTopZ - rootZ);
+    const zFork1 = rootZ + totalH * 0.48;
+    const zFork2 = rootZ + totalH * 0.76;
+
+    // 主幹在 zFork1 的轉折點（若從模型外圍繞入，在此高度剛好跨過階梯邊緣進入懸空區）
+    const fork1X = rootX * 0.35 + crownX * 0.65;
+    const fork1Y = rootY * 0.25 + crownY * 0.75;
+
+    // 將頂部 Tips 分為最多 2 個次級分枝群 (Sub-branches)
+    const subGroups = [[], []];
+    for (let i = 0; i < tips.length; i++) {
+      const t = tips[i];
+      const idx = t.x + t.y >= crownX + crownY ? 0 : 1;
+      subGroups[idx].push(t);
+    }
+    const activeSubs = subGroups.filter((g) => g.length > 0).map((subTips) => {
+      let sx = 0, sy = 0;
+      for (const st of subTips) {
+        sx += st.x;
+        sy += st.y;
+      }
+      sx /= subTips.length;
+      sy /= subTips.length;
+      return {
+        fork2X: fork1X * 0.3 + sx * 0.7,
+        fork2Y: fork1Y * 0.3 + sy * 0.7,
+        tips: subTips
+      };
+    });
+
+    trees.push({
+      rootX,
+      rootY,
+      rootZ,
+      fork1X,
+      fork1Y,
+      zFork1,
+      zFork2,
+      maxTopZ,
+      trunkBaseRadius: Math.min(5.2, 2.8 + Math.sqrt(tips.length) * 0.55),
+      trunkMidRadius: Math.min(3.8, 2.0 + Math.sqrt(tips.length) * 0.35),
+      subBranches: activeSubs
+    });
+  });
+
+  return trees;
+}
+
+// 在特定層高 Z 切出所有有機樹幹、中樹枝與頂部小細枝的平滑圓環截面
+function generateOrganicTreeLayerSegments(trees, z, lIdx, cfg, outerVertsForClip, outSupportSegs) {
+  for (let t = 0; t < trees.length; t++) {
+    const tree = trees[t];
+    if (z < tree.rootZ + 0.02 || z > tree.maxTopZ - cfg.layerHeight * 0.4) continue;
+
+    // 第一層 (Z = initialLayerHeight) 且樹根在熱床上：繪製 Bambu Studio 標誌性的「樹根同心圓裙邊底盤」
+    if (lIdx === 0 && tree.rootZ < 0.2) {
+      const baseR = tree.trunkBaseRadius * 1.25;
+      for (let ring = 0; ring < 4; ring++) {
+        addSmoothCircleRing(
+          tree.rootX,
+          tree.rootY,
+          baseR + ring * (cfg.lineWidth * 1.15),
+          20,
+          outerVertsForClip,
+          outSupportSegs
+        );
+      }
+      continue;
+    }
+
+    // 階段 1：底部粗主幹 (rootZ <= z <= zFork1)
+    if (z <= tree.zFork1) {
+      const u = (z - tree.rootZ) / Math.max(0.5, tree.zFork1 - tree.rootZ);
+      const s = smoothStep(u);
+      const cx = tree.rootX + (tree.fork1X - tree.rootX) * s;
+      const cy = tree.rootY + (tree.fork1Y - tree.rootY) * s;
+
+      // 樹根底部微喇開（Flare），往上平滑收細
+      const flare = u < 0.18 ? Math.pow(1 - u / 0.18, 2) * 1.4 : 0;
+      const radius = tree.trunkBaseRadius * (1 - u * 0.25) + flare;
+
+      addSmoothCircleRing(cx, cy, radius, 18, outerVertsForClip, outSupportSegs);
+      // 粗樹幹雙層壁厚，讓樹幹在視覺上更紮實飽滿
+      if (radius > 2.2) {
+        addSmoothCircleRing(cx, cy, radius - cfg.lineWidth * 0.9, 16, outerVertsForClip, outSupportSegs);
+      }
+    }
+    // 階段 2：主幹分岔為次級中樹枝 (zFork1 < z <= zFork2)
+    else if (z <= tree.zFork2) {
+      const u = (z - tree.zFork1) / Math.max(0.5, tree.zFork2 - tree.zFork1);
+      const s = smoothStep(u);
+
+      for (const sub of tree.subBranches) {
+        const cx = tree.fork1X + (sub.fork2X - tree.fork1X) * s;
+        const cy = tree.fork1Y + (sub.fork2Y - tree.fork1Y) * s;
+        const radius = tree.trunkMidRadius * (1 - u * 0.32);
+
+        addSmoothCircleRing(cx, cy, radius, 16, outerVertsForClip, outSupportSegs);
+      }
+    }
+    // 階段 3：中樹枝散開為多根細樹枝 (zFork2 < z < zTop) 精準頂住懸空屋簷底面
+    else {
+      for (const sub of tree.subBranches) {
+        for (const tip of sub.tips) {
+          if (z >= tip.zTop - cfg.layerHeight * 0.45) continue;
+          const u = (z - tree.zFork2) / Math.max(0.5, tip.zTop - tree.zFork2);
+          const s = smoothStep(Math.min(1, Math.max(0, u)));
+
+          const cx = sub.fork2X + (tip.x - sub.fork2X) * s;
+          const cy = sub.fork2Y + (tip.y - sub.fork2Y) * s;
+          // 由中樹枝半徑漸細至頂部接觸端 1.05mm
+          const startR = tree.trunkMidRadius * 0.68;
+          const endR = 1.1;
+          const radius = startR + (endR - startR) * u;
+
+          addSmoothCircleRing(cx, cy, radius, 12, outerVertsForClip, outSupportSegs);
+        }
+      }
+    }
+  }
+}
+
+// 繪製平滑圓形樹幹截面，並自動裁切掉與模型本體重疊的線段（確保樹幹貼著模型外圍長而不會刺穿模型）
+function addSmoothCircleRing(cx, cy, radius, sides, outerVertsForClip, outSupportSegs) {
+  const hasModel = outerVertsForClip && outerVertsForClip.length > 0;
+  for (let k = 0; k < sides; k++) {
+    const a1 = (k * 2 * Math.PI) / sides;
+    const a2 = ((k + 1) * 2 * Math.PI) / sides;
+    const x1 = cx + radius * Math.cos(a1);
+    const y1 = cy + radius * Math.sin(a1);
+    const x2 = cx + radius * Math.cos(a2);
+    const y2 = cy + radius * Math.sin(a2);
+    const mx = (x1 + x2) * 0.5;
+    const my = (y1 + y2) * 0.5;
+
+    if (hasModel && isPointInPolygon(outerVertsForClip, mx, my)) {
+      continue;
+    }
+    outSupportSegs.push({ x1, y1, x2, y2 });
+  }
+}
+
+// 三次平滑曲線插值 (Cubic Hermite Smoothstep)，讓樹幹彎曲與分岔處呈現自然有機的 S 型弧線
+function smoothStep(t) {
+  const c = Math.max(0, Math.min(1, t));
+  return c * c * (3 - 2 * c);
 }
 
 function interpolateZOnTri(px, py, a, b, c) {
@@ -504,7 +719,7 @@ function addInstancedExtrusions(group, segments, z, width, height, material) {
 
     dummy.position.set(mx, my, zCenter);
     dummy.rotation.set(0, 0, angle);
-    dummy.scale.set(seg.len + width * 0.2, width, height);
+    dummy.scale.set(seg.len + width * 0.25, width, height);
     dummy.updateMatrix();
     instMesh.setMatrixAt(i, dummy.matrix);
   }
@@ -513,7 +728,6 @@ function addInstancedExtrusions(group, segments, z, width, height, material) {
   group.add(instMesh);
 }
 
-// 不依賴法線正負號，只要正上方 (z ~ z + topThick) 或正下方 (z - bottomThick ~ z) 有水平面即觸發紫色殼層封頂
 function isNearHorizontalSurface(nonVerticalTris, px, py, z, topThick, bottomThick) {
   for (let i = 0; i < nonVerticalTris.length; i++) {
     const t = nonVerticalTris[i];

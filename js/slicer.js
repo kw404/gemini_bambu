@@ -72,13 +72,14 @@ export function sliceMesh(modelMesh, cfg) {
   const previewGroup = new THREE.Group();
   const layerGroups = [];
 
-  // Bambu Studio 標準線型顏色
-  const matOuterWall = new THREE.LineBasicMaterial({ color: 0xff7b24 });
-  const matInnerWall = new THREE.LineBasicMaterial({ color: 0xffd026 });
-  const matInfill = new THREE.LineBasicMaterial({ color: 0xd9383a });
-  const matTopBottom = new THREE.LineBasicMaterial({ color: 0x9a4dff });
-  const matSupport = new THREE.LineBasicMaterial({ color: 0x23d160 });
-  const matBrim = new THREE.LineBasicMaterial({ color: 0x2b8cff });
+  // 關鍵修正：加入 depthTest: false 與 renderOrder，防止預覽線條與模型交疊處發生穿透、簍空或閃爍
+  const lineMatConfig = { depthTest: false, transparent: true, opacity: 0.95 };
+  const matOuterWall = new THREE.LineBasicMaterial({ color: 0xff7b24, ...lineMatConfig });
+  const matInnerWall = new THREE.LineBasicMaterial({ color: 0xffd026, ...lineMatConfig });
+  const matInfill = new THREE.LineBasicMaterial({ color: 0xd9383a, ...lineMatConfig });
+  const matTopBottom = new THREE.LineBasicMaterial({ color: 0x9a4dff, ...lineMatConfig });
+  const matSupport = new THREE.LineBasicMaterial({ color: 0x23d160, ...lineMatConfig });
+  const matBrim = new THREE.LineBasicMaterial({ color: 0x2b8cff, ...lineMatConfig });
 
   // 支撐柱格點合併
   const supportColumns = new Map();
@@ -135,7 +136,7 @@ export function sliceMesh(modelMesh, cfg) {
     const cx = segCount > 0 ? sumX / segCount : 0;
     const cy = segCount > 0 ? sumY / segCount : 0;
 
-    // 2. 內牆圈數 (Inner Wall Loops)
+    // 2. 內牆圈數
     if (!cfg.spiralVase && cfg.wallLoops > 1 && outerVerts.length > 0) {
       const loops = Math.min(cfg.wallLoops - 1, 5);
       for (let w = 1; w <= loops; w++) {
@@ -153,13 +154,12 @@ export function sliceMesh(modelMesh, cfg) {
       }
     }
 
-    // 3. 頂部/底部實心殼層 vs 內部稀疏填充 (含蜂巢、陀螺儀等 5 種演算法)
+    // 3. 頂部/底部殼層 vs 內部稀疏填充
     const isShellLayer =
       !cfg.spiralVase && (lIdx < cfg.bottomLayers || lIdx >= totalLayers - cfg.topLayers);
 
     if (segCount > 0 && isFinite(minX)) {
       if (isShellLayer) {
-        // 頂底殼層：高密度平行線
         const shellStep = cfg.lineWidth * 2.3;
         const angle = lIdx % 2 === 0 ? 0 : Math.PI / 2;
         const len = generateRotatedHatch(
@@ -167,7 +167,6 @@ export function sliceMesh(modelMesh, cfg) {
         );
         totalExtrusionLengthMM += len;
       } else if (cfg.infillDensity > 0 && !cfg.spiralVase) {
-        // 計算填充間距 (密度越高間距越小)
         const spacing = Math.max(2.2, 22 * (1 - cfg.infillDensity / 112));
         const len = generatePatternInfill(
           cfg.infillPattern,
@@ -202,7 +201,7 @@ export function sliceMesh(modelMesh, cfg) {
       });
     }
 
-    // 5. 第一層裙邊 (Brim)
+    // 5. 第一層裙邊
     if (lIdx === 0 && cfg.brimType !== 'no_brim' && cfg.brimWidth > 0 && isFinite(minX)) {
       const rings = Math.min(8, Math.max(2, Math.round(cfg.brimWidth / 0.8)));
       for (let r = 1; r <= rings; r++) {
@@ -230,7 +229,6 @@ export function sliceMesh(modelMesh, cfg) {
     previewGroup.add(layerObj);
   }
 
-  // 計算預估耗材與時間
   const filamentArea = Math.PI * Math.pow(1.75 / 2, 2);
   const extrusionVolumeMM3 = totalExtrusionLengthMM * cfg.lineWidth * cfg.layerHeight;
   const filamentLengthM = extrusionVolumeMM3 / filamentArea / 1000;
@@ -251,29 +249,21 @@ export function sliceMesh(modelMesh, cfg) {
   };
 }
 
-// ============================================================================
-// 5 種真實幾何填充圖案產生器 (皆自動裁切於該層輪廓多邊形內)
-// ============================================================================
 function generatePatternInfill(pattern, outerVerts, minX, maxX, minY, maxY, z, lIdx, spacing, outVerts) {
   if (pattern === 'honeycomb') {
-    // 正六角形蜂巢結構 (Honeycomb Hexagonal Grid)
     return generateHoneycombInfill(outerVerts, minX, maxX, minY, maxY, z, spacing, outVerts);
   } else if (pattern === 'gyroid') {
-    // 陀螺儀波浪結構 (Gyroid - 隨 Z 層高度相位移動的正交正弦曲線)
     return generateGyroidInfill(outerVerts, minX, maxX, minY, maxY, z, spacing, outVerts);
   } else if (pattern === 'triangles') {
-    // 三角形網格 (0°, 60°, 120° 三向交叉)
     let len = 0;
     len += generateRotatedHatch(outerVerts, minX, maxX, minY, maxY, z, spacing * 1.15, 0, outVerts);
     len += generateRotatedHatch(outerVerts, minX, maxX, minY, maxY, z, spacing * 1.15, Math.PI / 3, outVerts);
     len += generateRotatedHatch(outerVerts, minX, maxX, minY, maxY, z, spacing * 1.15, (2 * Math.PI) / 3, outVerts);
     return len;
   } else if (pattern === 'rectilinear') {
-    // 直線交替 (奇偶層 ±45° 交替)
     const angle = lIdx % 2 === 0 ? Math.PI / 4 : -Math.PI / 4;
     return generateRotatedHatch(outerVerts, minX, maxX, minY, maxY, z, spacing * 0.85, angle, outVerts);
   } else {
-    // 預設網格 (Grid - 雙向正交)
     let len = 0;
     len += generateRotatedHatch(outerVerts, minX, maxX, minY, maxY, z, spacing, 0, outVerts);
     len += generateRotatedHatch(outerVerts, minX, maxX, minY, maxY, z, spacing, Math.PI / 2, outVerts);
@@ -281,10 +271,9 @@ function generatePatternInfill(pattern, outerVerts, minX, maxX, minY, maxY, z, l
   }
 }
 
-// 1. 蜂巢 (Honeycomb) 正六角形幾何生成與多邊形內部裁切
 function generateHoneycombInfill(outerVerts, minX, maxX, minY, maxY, z, spacing, outVerts) {
   let addedLength = 0;
-  const R = Math.max(2.0, spacing * 0.65); // 六角形邊長半徑
+  const R = Math.max(2.0, spacing * 0.65);
   const dx = R * 1.5;
   const dy = R * Math.sqrt(3);
 
@@ -297,15 +286,10 @@ function generateHoneycombInfill(outerVerts, minX, maxX, minY, maxY, z, spacing,
 
     for (let row = -1; row <= rows; row++) {
       const cy = minY + row * dy + yOffset;
-
-      // 每個六角形繪製左半與水平三條邊，避免相鄰六角形重複繪製
       const hexCorners = [];
       for (let k = 0; k < 6; k++) {
         const ang = (k * Math.PI) / 3;
-        hexCorners.push({
-          x: cx + R * Math.cos(ang),
-          y: cy + R * Math.sin(ang)
-        });
+        hexCorners.push({ x: cx + R * Math.cos(ang), y: cy + R * Math.sin(ang) });
       }
 
       for (let k = 0; k < 3; k++) {
@@ -318,7 +302,6 @@ function generateHoneycombInfill(outerVerts, minX, maxX, minY, maxY, z, spacing,
   return addedLength;
 }
 
-// 2. 陀螺儀 (Gyroid) 隨 Z 高度相位擺動之正弦波路徑
 function generateGyroidInfill(outerVerts, minX, maxX, minY, maxY, z, spacing, outVerts) {
   let addedLength = 0;
   const waveStep = Math.max(2.5, spacing * 0.95);
@@ -327,7 +310,6 @@ function generateGyroidInfill(outerVerts, minX, maxX, minY, maxY, z, spacing, ou
   const phaseZ = z * 0.65;
   const segStep = 1.6;
 
-  // 水平方向波浪
   for (let baseY = minY; baseY <= maxY; baseY += waveStep) {
     let prevX = minX;
     let prevY = baseY + Math.sin(prevX * freq + phaseZ) * amp;
@@ -344,7 +326,6 @@ function generateGyroidInfill(outerVerts, minX, maxX, minY, maxY, z, spacing, ou
     }
   }
 
-  // 垂直方向正交相位波浪
   for (let baseX = minX; baseX <= maxX; baseX += waveStep) {
     let prevY = minY;
     let prevX = baseX + Math.cos(prevY * freq - phaseZ) * amp;
@@ -360,11 +341,9 @@ function generateGyroidInfill(outerVerts, minX, maxX, minY, maxY, z, spacing, ou
       prevX = curX;
     }
   }
-
   return addedLength;
 }
 
-// 3. 任意角度平行掃描線裁切 (支援 0°, 45°, 60°, 90°, 120° 等)
 function generateRotatedHatch(outerVerts, minX, maxX, minY, maxY, z, spacing, angleRad, outVerts) {
   let addedLength = 0;
   const cosA = Math.cos(-angleRad);
@@ -413,7 +392,6 @@ function generateRotatedHatch(outerVerts, minX, maxX, minY, maxY, z, spacing, an
   return addedLength;
 }
 
-// 將短線段細分並判斷是否位於輪廓多邊形內部 (奇偶射線法 Even-Odd Rule)
 function clipSubdividedSegment(outerVerts, x1, y1, x2, y2, z, outVerts) {
   const subs = 3;
   let len = 0;

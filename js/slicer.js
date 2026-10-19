@@ -29,7 +29,11 @@ export function sliceMesh(modelMesh, cfg) {
   const cb = new THREE.Vector3();
   const ab = new THREE.Vector3();
 
-  // 判斷懸空角度：水平懸空面法向量 nz = -1，當 nz < -sin(thresholdAngle) 時需要支撐
+  // 同時精確計算 3D 網格的真實物理體積 (mm³) 與表面積 (mm²)
+  let signedVolumeSum = 0;
+  let sideSurfaceAreaMM2 = 0;
+  let flatTopBottomAreaMM2 = 0;
+
   const supportNzLimit = -Math.sin((Math.max(5, cfg.supportAngle) * Math.PI) / 180);
 
   for (let i = 0; i < triCount; i++) {
@@ -41,12 +45,23 @@ export function sliceMesh(modelMesh, cfg) {
     box.expandByPoint(vB);
     box.expandByPoint(vC);
 
+    // 有向四面體體積公式：V = (a · (b × c)) / 6
+    signedVolumeSum += vA.dot(cb.crossVectors(vB, vC)) / 6.0;
+
     const zMin = Math.min(vA.z, vB.z, vC.z);
     const zMax = Math.max(vA.z, vB.z, vC.z);
 
     cb.subVectors(vC, vB);
     ab.subVectors(vA, vB);
-    cb.cross(ab).normalize();
+    const crossVec = cb.cross(ab);
+    const triArea = crossVec.length() * 0.5;
+    const normal = crossVec.normalize();
+
+    if (Math.abs(normal.z) > 0.7) {
+      flatTopBottomAreaMM2 += triArea;
+    } else {
+      sideSurfaceAreaMM2 += triArea;
+    }
 
     const triObj = {
       a: vA.clone(),
@@ -54,7 +69,7 @@ export function sliceMesh(modelMesh, cfg) {
       c: vC.clone(),
       zMin,
       zMax,
-      nz: cb.z,
+      nz: normal.z,
       minX: Math.min(vA.x, vB.x, vC.x),
       maxX: Math.max(vA.x, vB.x, vC.x),
       minY: Math.min(vA.y, vB.y, vC.y),
@@ -62,20 +77,23 @@ export function sliceMesh(modelMesh, cfg) {
     };
     tris.push(triObj);
 
-    if (Math.abs(cb.z) > 0.35) {
+    if (Math.abs(normal.z) > 0.35) {
       flatZTris.push(triObj);
     }
   }
 
+  const realMeshVolumeMM3 = Math.abs(signedVolumeSum);
+
   // ============================================================================
-  // 真實 2D 網格垂直射線支撐偵測 (Raycasting Support Columns)
+  // 2D 網格垂直射線支撐偵測 (Raycasting Support Columns)
   // ============================================================================
   const supportSpans = [];
+  let totalSupportHeightMM = 0;
+
   if (cfg.supportEnable && isFinite(box.min.x)) {
-    const gridStep = 3.6; // 支撐柱格點間距 (mm)
+    const gridStep = 3.6;
     for (let gx = box.min.x + 1.5; gx <= box.max.x - 1.5; gx += gridStep) {
       for (let gy = box.min.y + 1.5; gy <= box.max.y - 1.5; gy += gridStep) {
-        // 收集通過 (gx, gy) 的所有頂面與底面交點
         const hits = [];
         for (let i = 0; i < flatZTris.length; i++) {
           const t = flatZTris[i];
@@ -87,14 +105,11 @@ export function sliceMesh(modelMesh, cfg) {
         }
         if (hits.length === 0) continue;
 
-        // 依高度由低到高排序並去除重疊面
         hits.sort((a, b) => a.z - b.z);
 
         for (let h = 0; h < hits.length; h++) {
           const hit = hits[h];
-          // 若是朝下的懸空面 (nz <= supportNzLimit) 且距離底部超過 1.2mm
           if (hit.nz <= supportNzLimit && hit.z > 1.2) {
-            // 往下方尋找最近的一個朝上模型頂面 (nz > 0.2)
             let zBase = 0;
             for (let k = h - 1; k >= 0; k--) {
               if (hits[k].nz > 0.2 && hits[k].z < hit.z - 0.8) {
@@ -103,9 +118,7 @@ export function sliceMesh(modelMesh, cfg) {
               }
             }
 
-            // 檢查這個區間中點是否誤處於其他疊加方塊的內部
             if (hit.z - zBase > 1.2) {
-              // 若勾選「僅在列印板生成」，則只允許 zBase 接近 0 (熱床) 的支撐柱
               if (cfg.supportBuildPlateOnly && zBase > 0.6) continue;
 
               supportSpans.push({
@@ -114,6 +127,7 @@ export function sliceMesh(modelMesh, cfg) {
                 zBottom: zBase,
                 zTop: hit.z
               });
+              totalSupportHeightMM += hit.z - zBase;
             }
           }
         }
@@ -142,13 +156,13 @@ export function sliceMesh(modelMesh, cfg) {
   const matSupport = new THREE.MeshStandardMaterial({ color: 0x23d160, ...matConfig });
   const matBrim = new THREE.MeshStandardMaterial({ color: 0x2b8cff, ...matConfig });
 
-  let totalExtrusionLengthMM = 0;
-  let supportExtrusionLengthMM = 0;
   const topShellThicknessZ = cfg.topLayers * cfg.layerHeight + 0.05;
   const bottomShellThicknessZ = cfg.bottomLayers * cfg.layerHeight + 0.05;
 
   const densityRatio = Math.max(0.02, Math.min(0.98, cfg.infillDensity / 100));
   const realInfillSpacing = Math.max(cfg.lineWidth * 1.3, (cfg.lineWidth * 1.95) / densityRatio);
+
+  let brimExtrusionMM = 0;
 
   for (let lIdx = 0; lIdx < totalLayers; lIdx++) {
     const z = layerZs[lIdx];
@@ -185,7 +199,6 @@ export function sliceMesh(modelMesh, cfg) {
           nx: -(p2.y - p1.y) / segLen,
           ny: (p2.x - p1.x) / segLen
         });
-        totalExtrusionLengthMM += segLen * cfg.wallLoops;
 
         minX = Math.min(minX, p1.x, p2.x);
         maxX = Math.max(maxX, p1.x, p2.x);
@@ -242,7 +255,7 @@ export function sliceMesh(modelMesh, cfg) {
       const shellAngle = lIdx % 2 === 0 ? Math.PI / 4 : -Math.PI / 4;
 
       if (isGlobalBottomOrTop) {
-        totalExtrusionLengthMM += generateRotatedHatchSegments(
+        generateRotatedHatchSegments(
           outerVertsForClip, minX, maxX, minY, maxY, shellStep, shellAngle, wallInset, shellSegments
         );
       } else {
@@ -266,7 +279,6 @@ export function sliceMesh(modelMesh, cfg) {
 
             if (isNearTopOrBottomSurface(flatZTris, mx, my, z, topShellThicknessZ, bottomShellThicknessZ)) {
               shellSegments.push({ x1, y1, x2, y2 });
-              totalExtrusionLengthMM += Math.hypot(x2 - x1, y2 - y1);
             }
           }
         }
@@ -292,21 +304,19 @@ export function sliceMesh(modelMesh, cfg) {
             const my = (seg.y1 + seg.y2) * 0.5;
             if (!isNearTopOrBottomSurface(flatZTris, mx, my, z, topShellThicknessZ, bottomShellThicknessZ)) {
               infillSegments.push(seg);
-              totalExtrusionLengthMM += Math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1);
             }
           }
         }
       }
     }
 
-    // 4. 生成支撐結構（普通方格柱狀 Normal vs 樹狀有機圓環分支 Tree）
+    // 4. 支撐結構
     if (cfg.supportEnable && supportSpans.length > 0) {
       const isTree = cfg.supportType.includes('tree') || cfg.supportStyle === 'organic';
 
       for (let s = 0; s < supportSpans.length; s++) {
         const sp = supportSpans[s];
         if (z > sp.zBottom + 0.05 && z < sp.zTop - cfg.layerHeight * 0.6) {
-          // 確保支撐點不會畫進該層已經存在的模型實體多邊形內
           if (outerVertsForClip.length > 0 && isPointInPolygon(outerVertsForClip, sp.x, sp.y)) {
             continue;
           }
@@ -314,7 +324,6 @@ export function sliceMesh(modelMesh, cfg) {
           const progress = (z - sp.zBottom) / Math.max(1, sp.zTop - sp.zBottom);
 
           if (isTree) {
-            // 樹狀支撐：底部粗、往上漸細並略微向中心聚攏的八角形樹幹
             const radius = 1.9 * (1 - progress * 0.42);
             const trunkShiftX = Math.sin(progress * Math.PI) * 0.6;
             const cx = sp.x + trunkShiftX;
@@ -330,20 +339,16 @@ export function sliceMesh(modelMesh, cfg) {
                 y2: cy + radius * Math.sin(a2)
               });
             }
-            supportExtrusionLengthMM += radius * 6;
           } else {
-            // 普通支撐 (Normal)：蛇行波浪折線支撐牆 + 頂部接觸介面層
             const r = 1.55;
             const isInterfaceLayer = z > sp.zTop - cfg.layerHeight * 3.2;
             if (isInterfaceLayer) {
-              // 支撐頂部接觸層（密集格線）
               supportSegments.push(
                 { x1: sp.x - r, y1: sp.y - r, x2: sp.x + r, y2: sp.y - r },
                 { x1: sp.x - r, y1: sp.y, x2: sp.x + r, y2: sp.y },
                 { x1: sp.x - r, y1: sp.y + r, x2: sp.x + r, y2: sp.y + r }
               );
             } else {
-              // 普通支撐主體（方柱加對角支撐肋）
               supportSegments.push(
                 { x1: sp.x - r, y1: sp.y - r, x2: sp.x + r, y2: sp.y - r },
                 { x1: sp.x + r, y1: sp.y - r, x2: sp.x + r, y2: sp.y + r },
@@ -351,11 +356,9 @@ export function sliceMesh(modelMesh, cfg) {
                 { x1: sp.x - r, y1: sp.y + r, x2: sp.x - r, y2: sp.y - r }
               );
             }
-            supportExtrusionLengthMM += r * 8;
           }
         }
       }
-      totalExtrusionLengthMM += supportExtrusionLengthMM;
     }
 
     // 5. 第一層裙邊 (Brim)
@@ -371,7 +374,7 @@ export function sliceMesh(modelMesh, cfg) {
           { x1: bx1, y1: by1, x2: bx0, y2: by1 },
           { x1: bx0, y1: by1, x2: bx0, y2: by0 }
         );
-        totalExtrusionLengthMM += (bx1 - bx0 + by1 - by0) * 2;
+        brimExtrusionMM += (bx1 - bx0 + by1 - by0) * 2;
       }
     }
 
@@ -387,28 +390,80 @@ export function sliceMesh(modelMesh, cfg) {
     previewGroup.add(layerObj);
   }
 
-  const filamentArea = Math.PI * Math.pow(1.75 / 2, 2);
-  const extrusionVolumeMM3 = totalExtrusionLengthMM * cfg.lineWidth * cfg.layerHeight;
-  const filamentLengthM = extrusionVolumeMM3 / filamentArea / 1000;
-  const weightGrams = (extrusionVolumeMM3 / 1000) * 1.24;
-  const avgSpeed = (cfg.speedOuter + cfg.speedInner + cfg.speedInfill) / 3;
-  const timeSeconds = totalExtrusionLengthMM / (avgSpeed * 0.55) + totalLayers * 1.8;
+  // ============================================================================
+  // 基於 3D 網格真實幾何體積 (realMeshVolumeMM3) 的精準物理克數與耗材長度計算
+  // ============================================================================
+  // 1. 外牆體積 (mm³) = 側面表面積 × 單圈線寬
+  const volOuterWall = sideSurfaceAreaMM2 * cfg.lineWidth;
+  // 2. 內牆體積 (mm³) = 側面表面積 × (牆圈數 - 1) × 線寬
+  const volInnerWall = cfg.spiralVase
+    ? 0
+    : sideSurfaceAreaMM2 * Math.max(0, cfg.wallLoops - 1) * (cfg.lineWidth * 0.92);
+  // 3. 頂底實心殼層體積 (mm³) = 頂底投影面積 × 平均殼層數 × 層高
+  const avgShellLayers = (cfg.topLayers + cfg.bottomLayers) * 0.5;
+  const volShell = cfg.spiralVase
+    ? (flatTopBottomAreaMM2 * 0.5) * cfg.bottomLayers * cfg.layerHeight
+    : flatTopBottomAreaMM2 * avgShellLayers * cfg.layerHeight;
+
+  // 4. 內部空腔剩餘體積 × 填充密度 (%)
+  const shellAndWallVol = Math.min(realMeshVolumeMM3 * 0.92, volOuterWall + volInnerWall + volShell);
+  const interiorCoreVolume = Math.max(0, realMeshVolumeMM3 - shellAndWallVol);
+  const patternMultiplier =
+    cfg.infillPattern === 'honeycomb' ? 1.15 : cfg.infillPattern === 'gyroid' ? 1.1 : 1.0;
+  const volInfill = cfg.spiralVase
+    ? 0
+    : interiorCoreVolume * (cfg.infillDensity / 100) * patternMultiplier;
+
+  // 5. 支撐與裙邊體積 (mm³)
+  const supportAreaPerCol = cfg.supportType.includes('tree') ? 2.4 : 3.1; // 每個支撐格柱截面積 mm²
+  const volSupport = cfg.supportEnable ? totalSupportHeightMM * supportAreaPerCol : 0;
+  const volBrim = brimExtrusionMM * cfg.initialLineWidth * cfg.initialLayerHeight;
+
+  const totalExtrudedVolumeMM3 =
+    volOuterWall + volInnerWall + volShell + volInfill + volSupport + volBrim;
+
+  // 換算為 1.75mm 線材長度 (m) 與 PLA 重量 (g，密度 1.24 g/cm³)
+  const filamentCrossSectionMM2 = Math.PI * Math.pow(1.75 * 0.5, 2); // 2.4053 mm²
+  const filamentLengthM = totalExtrudedVolumeMM3 / filamentCrossSectionMM2 / 1000;
+  const weightGrams = (totalExtrudedVolumeMM3 / 1000) * 1.24;
+
+  // 依據擠出路徑長度與各部位速度計算列印時間
+  const beadArea = Math.max(0.04, cfg.lineWidth * cfg.layerHeight * 0.9);
+  const accelEfficiency = 0.58;
+  const timeSeconds =
+    (volOuterWall / beadArea) / (cfg.speedOuter * accelEfficiency) +
+    (volInnerWall / beadArea) / (cfg.speedInner * accelEfficiency) +
+    (volInfill / beadArea) / (cfg.speedInfill * accelEfficiency) +
+    (volShell / beadArea) / (cfg.speedInner * 0.75 * accelEfficiency) +
+    (volSupport / beadArea) / (cfg.speedInfill * 0.7 * accelEfficiency) +
+    (volBrim / beadArea) / (cfg.speedInitial * accelEfficiency) +
+    totalLayers * 1.4;
+
+  const safeVol = Math.max(1, totalExtrudedVolumeMM3);
+  const pctByType = {
+    outer: Math.round((volOuterWall / safeVol) * 100),
+    inner: Math.round((volInnerWall / safeVol) * 100),
+    infill: Math.round((volInfill / safeVol) * 100),
+    shell: Math.round((volShell / safeVol) * 100),
+    support: Math.round((volSupport / safeVol) * 100),
+    brim: Math.max(volBrim > 0 ? 1 : 0, Math.round((volBrim / safeVol) * 100))
+  };
 
   return {
     previewGroup,
     layerZs,
     layerGroups,
     totalLayers,
-    filamentLengthM: Math.max(0.15, filamentLengthM),
-    weightGrams: Math.max(0.5, weightGrams),
-    timeSeconds: Math.max(60, timeSeconds),
+    filamentLengthM: Math.max(0.05, filamentLengthM),
+    weightGrams: Math.max(0.2, weightGrams),
+    timeSeconds: Math.max(30, timeSeconds),
+    pctByType,
     patternLabel: PATTERN_LABELS[cfg.infillPattern] || cfg.infillPattern,
     hasSupportGenerated: supportSpans.length > 0,
     settings: cfg
   };
 }
 
-// 計算平面三角形在 (px, py) 處的精確 Z 高度
 function interpolateZOnTri(px, py, a, b, c) {
   const det = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
   if (Math.abs(det) < 1e-6) return (a.z + b.z + c.z) / 3;

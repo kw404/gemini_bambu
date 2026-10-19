@@ -148,45 +148,38 @@ export function snapMeshToBed(mesh) {
   }
 }
 
-// 建立一體成型（無重疊面）、具備階梯頂面、懸空屋簷與頂部圓柱的教學模型
-// 請替換 js/scene.js 底部的 createDemoGeometry 函式：
+// 建立百分之百封閉水密（Watertight Manifold）、無共面抵銷、無空層的單一整合教學模型
+// 透過 2D 側面輪廓直接拉伸 (ExtrudeGeometry)，保證所有階梯與懸空屋簷在 Bambu Studio 中 100% 連續無空層！
 export function createDemoGeometry() {
-  const geometries = [];
+  // 在 X-Z 平面定義一體成型的「階梯 + 右側懸空屋簷 + 頂部凸台」封閉多邊形輪廓
+  // 這樣完全不會有任何兩個獨立方塊在 Z=10, Z=20, Z=26 共面相撞導致 Bambu Studio 報空層錯誤！
+  const profile = new THREE.Shape();
 
-  // 第 1 層大底盤：X = -30 ~ +22, Z = 0 ~ 10 mm (52 x 46 x 10)
-  const step1 = new THREE.BoxGeometry(52, 46, 10);
-  step1.translate(-4, 0, 5);
-  geometries.push(step1);
+  // 從左下角 (-26, 0) 開始逆時針繞一圈：
+  profile.moveTo(-26, 0);
+  profile.lineTo(18, 0);     // 底座寬 44mm (X: -26 ~ +18)
+  profile.lineTo(18, 10);    // 第一階高度 Z = 10mm
+  profile.lineTo(0, 10);     // 第一階平台頂面 (X: 0 ~ +18, Z = 10)
+  profile.lineTo(0, 20);     // 第二階高度 Z = 20mm
+  profile.lineTo(30, 20);    // 懸空屋簷底面！從 X=0 直接向右延伸到 X=+30 (懸空長達 30mm，其中 X=18~30 直接對著熱床懸空)
+  profile.lineTo(30, 26);    // 懸空屋簷厚度 6mm (Z: 20 ~ 26)
+  profile.lineTo(-8, 26);    // 屋簷右側頂面 (X: -8 ~ +30, Z = 26)
+  profile.lineTo(-8, 34);    // 頂部方塔凸台高度 Z = 34mm (X: -22 ~ -8)
+  profile.lineTo(-22, 34);   // 頂部凸台頂面 (Z = 34)
+  profile.lineTo(-22, 26);   // 回到 Z = 26 左側屋頂
+  profile.lineTo(-26, 26);   // 左側邊緣
+  profile.closePath();       // 回到 (-26, 0) 完美封閉
 
-  // 第 2 層階梯：X = -30 ~ +4, Z = 10 ~ 20 mm (34 x 46 x 10)，右側留出 Z=10mm 的階梯平台
-  const step2 = new THREE.BoxGeometry(34, 46, 10);
-  step2.translate(-13, 0, 15);
-  geometries.push(step2);
+  const depthY = 40; // Y 軸深度 40mm
+  const geo = new THREE.ExtrudeGeometry(profile, {
+    steps: 1,
+    depth: depthY,
+    bevelEnabled: false
+  });
 
-  // 第 3 層懸空屋頂：X = -30 ~ +36, Z = 20 ~ 26 mm (66 x 32 x 6)
-  // 其中 X = +4 ~ +22 懸空在第一階平台上；X = +22 ~ +36 則完全懸空在 PEI 熱床上方！
-  const roof = new THREE.BoxGeometry(66, 32, 6);
-  roof.translate(3, 0, 23);
-  geometries.push(roof);
-
-  // 第 4 層頂部圓柱：Z = 26 ~ 34 mm (半徑 9mm，高 8mm)
-  const cyl = new THREE.CylinderGeometry(9, 9, 8, 32);
-  cyl.rotateX(Math.PI / 2);
-  cyl.translate(-13, 0, 30);
-  geometries.push(cyl);
-
-  const positions = [];
-  for (const g of geometries) {
-    const nonIdx = g.index ? g.toNonIndexed() : g;
-    const posAttr = nonIdx.attributes.position;
-    for (let i = 0; i < posAttr.count; i++) {
-      positions.push(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
-    }
-    g.dispose();
-  }
-
-  const out = new THREE.BufferGeometry();
-  out.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  out.computeVertexNormals();
-  return out;
+  // ExtrudeGeometry 預設在 X-Y 平面並沿 Z 拉伸，我們將它轉正為 X-Z 輪廓、沿 Y 軸前後對稱
+  geo.rotateX(Math.PI / 2);
+  geo.translate(0, depthY / 2, 0);
+  geo.computeVertexNormals();
+  return geo;
 }

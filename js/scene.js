@@ -150,36 +150,83 @@ export function snapMeshToBed(mesh) {
 
 // 建立百分之百封閉水密（Watertight Manifold）、無共面抵銷、無空層的單一整合教學模型
 // 透過 2D 側面輪廓直接拉伸 (ExtrudeGeometry)，保證所有階梯與懸空屋簷在 Bambu Studio 中 100% 連續無空層！
+// 請替換 js/scene.js 底部的 createDemoGeometry 函式：
 export function createDemoGeometry() {
-  // 在 X-Z 平面定義一體成型的「階梯 + 右側懸空屋簷 + 頂部凸台」封閉多邊形輪廓
-  // 這樣完全不會有任何兩個獨立方塊在 Z=10, Z=20, Z=26 共面相撞導致 Bambu Studio 報空層錯誤！
+  // 在 ExtrudeGeometry 轉正 (rotateX(PI/2)) 後，為了讓所有側面法向量正確朝向模型外部，
+  // 我們在定義 2D 截面時採用順時針 (Clockwise) 順序，或者在建立後自動校正三角形環繞方向。
   const profile = new THREE.Shape();
 
-  // 從左下角 (-26, 0) 開始逆時針繞一圈：
+  // 順時針繞行一圈，確保 rotateX(Math.PI / 2) 後外法線 100% 朝外：
   profile.moveTo(-26, 0);
-  profile.lineTo(18, 0);     // 底座寬 44mm (X: -26 ~ +18)
-  profile.lineTo(18, 10);    // 第一階高度 Z = 10mm
-  profile.lineTo(0, 10);     // 第一階平台頂面 (X: 0 ~ +18, Z = 10)
-  profile.lineTo(0, 20);     // 第二階高度 Z = 20mm
-  profile.lineTo(30, 20);    // 懸空屋簷底面！從 X=0 直接向右延伸到 X=+30 (懸空長達 30mm，其中 X=18~30 直接對著熱床懸空)
-  profile.lineTo(30, 26);    // 懸空屋簷厚度 6mm (Z: 20 ~ 26)
-  profile.lineTo(-8, 26);    // 屋簷右側頂面 (X: -8 ~ +30, Z = 26)
-  profile.lineTo(-8, 34);    // 頂部方塔凸台高度 Z = 34mm (X: -22 ~ -8)
-  profile.lineTo(-22, 34);   // 頂部凸台頂面 (Z = 34)
-  profile.lineTo(-22, 26);   // 回到 Z = 26 左側屋頂
-  profile.lineTo(-26, 26);   // 左側邊緣
-  profile.closePath();       // 回到 (-26, 0) 完美封閉
+  profile.lineTo(-26, 26);   // 左側外牆
+  profile.lineTo(-22, 26);   // 左側小平台
+  profile.lineTo(-22, 34);   // 頂部凸台左牆
+  profile.lineTo(-8, 34);    // 頂部凸台頂面 (Z = 34mm, 朝上)
+  profile.lineTo(-8, 26);    // 頂部凸台右牆
+  profile.lineTo(30, 26);    // 懸空屋簷頂面 (Z = 26mm, 朝上)
+  profile.lineTo(30, 20);    // 懸空屋簷右端
+  profile.lineTo(0, 20);     // 懸空屋簷底面 (Z = 20mm, X = 0 ~ +30，朝下懸空！)
+  profile.lineTo(0, 10);     // 第二階右牆
+  profile.lineTo(18, 10);    // 第一階平台頂面 (Z = 10mm, X = 0 ~ +18，朝上)
+  profile.lineTo(18, 0);     // 第一階右牆
+  profile.closePath();       // 底座底面 (Z = 0mm, X = -26 ~ +18，朝下貼齊熱床)
 
-  const depthY = 40; // Y 軸深度 40mm
+  const depthY = 40;
   const geo = new THREE.ExtrudeGeometry(profile, {
     steps: 1,
     depth: depthY,
     bevelEnabled: false
   });
 
-  // ExtrudeGeometry 預設在 X-Y 平面並沿 Z 拉伸，我們將它轉正為 X-Z 輪廓、沿 Y 軸前後對稱
   geo.rotateX(Math.PI / 2);
   geo.translate(0, depthY / 2, 0);
+
+  // 強制檢查並確保網格體積為正（所有三角形頂點順序皆為標準外法線方向）
+  ensureOutwardNormals(geo);
   geo.computeVertexNormals();
   return geo;
+}
+
+// 檢查有向體積，若為負代表整體法線朝內，自動翻轉三角形頂點順序以符合 Bambu Studio 與切片器標準
+function ensureOutwardNormals(geometry) {
+  const pos = geometry.attributes.position;
+  const index = geometry.index;
+  const vA = new THREE.Vector3();
+  const vB = new THREE.Vector3();
+  const vC = new THREE.Vector3();
+  const cross = new THREE.Vector3();
+  let signedVol = 0;
+
+  if (index) {
+    for (let i = 0; i < index.count; i += 3) {
+      vA.fromBufferAttribute(pos, index.getX(i));
+      vB.fromBufferAttribute(pos, index.getX(i + 1));
+      vC.fromBufferAttribute(pos, index.getX(i + 2));
+      signedVol += vA.dot(cross.crossVectors(vB, vC));
+    }
+    if (signedVol < 0) {
+      for (let i = 0; i < index.count; i += 3) {
+        const tmp = index.getX(i + 1);
+        index.setX(i + 1, index.getX(i + 2));
+        index.setX(i + 2, tmp);
+      }
+      index.needsUpdate = true;
+    }
+  } else {
+    for (let i = 0; i < pos.count; i += 3) {
+      vA.fromBufferAttribute(pos, i);
+      vB.fromBufferAttribute(pos, i + 1);
+      vC.fromBufferAttribute(pos, i + 2);
+      signedVol += vA.dot(cross.crossVectors(vB, vC));
+    }
+    if (signedVol < 0) {
+      for (let i = 0; i < pos.count; i += 3) {
+        vB.fromBufferAttribute(pos, i + 1);
+        vC.fromBufferAttribute(pos, i + 2);
+        pos.setXYZ(i + 1, vC.x, vC.y, vC.z);
+        pos.setXYZ(i + 2, vB.x, vB.y, vB.z);
+      }
+      pos.needsUpdate = true;
+    }
+  }
 }

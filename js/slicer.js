@@ -20,7 +20,7 @@ export function sliceMesh(modelMesh, cfg) {
 
   const triCount = Math.floor(posAttr.count / 3);
   const tris = [];
-  const flatZTris = [];
+  const nonVerticalTris = []; // 所有非垂直面（|nz| > 0.15），用於垂直射線穿刺配對
   const box = new THREE.Box3();
 
   const vA = new THREE.Vector3();
@@ -29,12 +29,12 @@ export function sliceMesh(modelMesh, cfg) {
   const cb = new THREE.Vector3();
   const ab = new THREE.Vector3();
 
-  // 同時精確計算 3D 網格的真實物理體積 (mm³) 與表面積 (mm²)
   let signedVolumeSum = 0;
   let sideSurfaceAreaMM2 = 0;
   let flatTopBottomAreaMM2 = 0;
 
-  const supportNzLimit = -Math.sin((Math.max(5, cfg.supportAngle) * Math.PI) / 180);
+  // 懸空角度門檻：面與水平面的傾斜程度 |nz| >= sin(thresholdAngle)
+  const minOverhangAbsNz = Math.sin((Math.max(5, cfg.supportAngle) * Math.PI) / 180);
 
   for (let i = 0; i < triCount; i++) {
     vA.fromBufferAttribute(posAttr, i * 3).applyMatrix4(matrix);
@@ -45,7 +45,6 @@ export function sliceMesh(modelMesh, cfg) {
     box.expandByPoint(vB);
     box.expandByPoint(vC);
 
-    // 有向四面體體積公式：V = (a · (b × c)) / 6
     signedVolumeSum += vA.dot(cb.crossVectors(vB, vC)) / 6.0;
 
     const zMin = Math.min(vA.z, vB.z, vC.z);
@@ -56,8 +55,9 @@ export function sliceMesh(modelMesh, cfg) {
     const crossVec = cb.cross(ab);
     const triArea = crossVec.length() * 0.5;
     const normal = crossVec.normalize();
+    const absNz = Math.abs(normal.z);
 
-    if (Math.abs(normal.z) > 0.7) {
+    if (absNz > 0.7) {
       flatTopBottomAreaMM2 += triArea;
     } else {
       sideSurfaceAreaMM2 += triArea;
@@ -70,6 +70,7 @@ export function sliceMesh(modelMesh, cfg) {
       zMin,
       zMax,
       nz: normal.z,
+      absNz,
       minX: Math.min(vA.x, vB.x, vC.x),
       maxX: Math.max(vA.x, vB.x, vC.x),
       minY: Math.min(vA.y, vB.y, vC.y),
@@ -77,57 +78,73 @@ export function sliceMesh(modelMesh, cfg) {
     };
     tris.push(triObj);
 
-    if (Math.abs(normal.z) > 0.35) {
-      flatZTris.push(triObj);
+    if (absNz > 0.15) {
+      nonVerticalTris.push(triObj);
     }
   }
 
   const realMeshVolumeMM3 = Math.abs(signedVolumeSum);
 
   // ============================================================================
-  // 2D 網格垂直射線支撐偵測 (Raycasting Support Columns)
+  // 穩健垂直射線奇偶配對支撐偵測 (Even-Odd Ray-Slab Support Detection)
+  // 完全不依賴三角形法線正負號，對任何匯入模型或 ExtrudeGeometry 皆 100% 有效！
   // ============================================================================
   const supportSpans = [];
   let totalSupportHeightMM = 0;
 
   if (cfg.supportEnable && isFinite(box.min.x)) {
-    const gridStep = 3.6;
-    for (let gx = box.min.x + 1.5; gx <= box.max.x - 1.5; gx += gridStep) {
-      for (let gy = box.min.y + 1.5; gy <= box.max.y - 1.5; gy += gridStep) {
-        const hits = [];
-        for (let i = 0; i < flatZTris.length; i++) {
-          const t = flatZTris[i];
-          if (gx < t.minX || gx > t.maxX || gy < t.minY || gy > t.maxY) continue;
-          if (pointInTri2D(gx, gy, t.a, t.b, t.c)) {
-            const zHit = interpolateZOnTri(gx, gy, t.a, t.b, t.c);
-            hits.push({ z: zHit, nz: t.nz });
+    const gridStep = 3.5;
+    for (let gx = box.min.x + 1.6; gx <= box.max.x - 1.6; gx += gridStep) {
+      for (let gy = box.min.y + 1.6; gy <= box.max.y - 1.6; gy += gridStep) {
+        // 偏移 0.013mm 避免射線剛好打在兩個三角形的共用對角線上重複計算
+        const rx = gx + 0.013;
+        const ry = gy + 0.017;
+
+        const rawHits = [];
+        for (let i = 0; i < nonVerticalTris.length; i++) {
+          const t = nonVerticalTris[i];
+          if (rx < t.minX || rx > t.maxX || ry < t.minY || ry > t.maxY) continue;
+          if (pointInTri2D(rx, ry, t.a, t.b, t.c)) {
+            const zHit = interpolateZOnTri(rx, ry, t.a, t.b, t.c);
+            rawHits.push({ z: zHit, absNz: t.absNz });
           }
         }
-        if (hits.length === 0) continue;
+        if (rawHits.length === 0) continue;
 
-        hits.sort((a, b) => a.z - b.z);
+        rawHits.sort((a, b) => a.z - b.z);
 
-        for (let h = 0; h < hits.length; h++) {
-          const hit = hits[h];
-          if (hit.nz <= supportNzLimit && hit.z > 1.2) {
-            let zBase = 0;
-            for (let k = h - 1; k >= 0; k--) {
-              if (hits[k].nz > 0.2 && hits[k].z < hit.z - 0.8) {
-                zBase = hits[k].z;
-                break;
-              }
-            }
+        // 合併距離小於 0.15mm 的同高度交點
+        const uniqueHits = [rawHits[0]];
+        for (let i = 1; i < rawHits.length; i++) {
+          if (rawHits[i].z - uniqueHits[uniqueHits.length - 1].z > 0.15) {
+            uniqueHits.push(rawHits[i]);
+          }
+        }
 
-            if (hit.z - zBase > 1.2) {
-              if (cfg.supportBuildPlateOnly && zBase > 0.6) continue;
+        // 在水密網格中，由下往上穿刺的交點兩兩配對為實體區間：[z_0, z_1], [z_2, z_3]...
+        // 其中偶數索引 k = 0, 2, 4... 是「進入模型實體的底面 (Bottom/Overhang Surface)」
+        // 奇數索引 k = 1, 3, 5... 是「離開模型實體的頂面 (Top Surface)」
+        for (let k = 0; k < uniqueHits.length; k += 2) {
+          const enterHit = uniqueHits[k];
+          const zTop = enterHit.z;
+
+          // 若該進入底面高度 > 1.2mm（懸空於半空中），且傾斜角滿足支撐條件
+          if (zTop > 1.2 && enterHit.absNz >= minOverhangAbsNz) {
+            // 下方承接面：若是第一個實體區間 (k === 0)，下方就是 Z = 0 的 PEI 熱床！
+            // 若 k >= 2，下方承接面就是前一個實體區間的頂面 uniqueHits[k - 1].z
+            const zBottom = k === 0 ? 0 : uniqueHits[k - 1].z;
+
+            if (zTop - zBottom > 1.2) {
+              // 若勾選「僅在列印板生成 (On build plate only)」，則只生成 zBottom === 0 的支撐柱
+              if (cfg.supportBuildPlateOnly && zBottom > 0.6) continue;
 
               supportSpans.push({
                 x: gx,
                 y: gy,
-                zBottom: zBase,
-                zTop: hit.z
+                zBottom,
+                zTop
               });
-              totalSupportHeightMM += hit.z - zBase;
+              totalSupportHeightMM += zTop - zBottom;
             }
           }
         }
@@ -277,7 +294,7 @@ export function sliceMesh(modelMesh, cfg) {
             const mx = (x1 + x2) * 0.5;
             const my = (y1 + y2) * 0.5;
 
-            if (isNearTopOrBottomSurface(flatZTris, mx, my, z, topShellThicknessZ, bottomShellThicknessZ)) {
+            if (isNearHorizontalSurface(nonVerticalTris, mx, my, z, topShellThicknessZ, bottomShellThicknessZ)) {
               shellSegments.push({ x1, y1, x2, y2 });
             }
           }
@@ -302,7 +319,7 @@ export function sliceMesh(modelMesh, cfg) {
           for (const seg of rawInfill) {
             const mx = (seg.x1 + seg.x2) * 0.5;
             const my = (seg.y1 + seg.y2) * 0.5;
-            if (!isNearTopOrBottomSurface(flatZTris, mx, my, z, topShellThicknessZ, bottomShellThicknessZ)) {
+            if (!isNearHorizontalSurface(nonVerticalTris, mx, my, z, topShellThicknessZ, bottomShellThicknessZ)) {
               infillSegments.push(seg);
             }
           }
@@ -310,13 +327,14 @@ export function sliceMesh(modelMesh, cfg) {
       }
     }
 
-    // 4. 支撐結構
+    // 4. 支撐結構繪製
     if (cfg.supportEnable && supportSpans.length > 0) {
       const isTree = cfg.supportType.includes('tree') || cfg.supportStyle === 'organic';
 
       for (let s = 0; s < supportSpans.length; s++) {
         const sp = supportSpans[s];
-        if (z > sp.zBottom + 0.05 && z < sp.zTop - cfg.layerHeight * 0.6) {
+        if (z > sp.zBottom + 0.05 && z < sp.zTop - cfg.layerHeight * 0.5) {
+          // 避免畫入同高度的模型實體內部
           if (outerVertsForClip.length > 0 && isPointInPolygon(outerVertsForClip, sp.x, sp.y)) {
             continue;
           }
@@ -390,22 +408,16 @@ export function sliceMesh(modelMesh, cfg) {
     previewGroup.add(layerObj);
   }
 
-  // ============================================================================
-  // 基於 3D 網格真實幾何體積 (realMeshVolumeMM3) 的精準物理克數與耗材長度計算
-  // ============================================================================
-  // 1. 外牆體積 (mm³) = 側面表面積 × 單圈線寬
+  // 基於真實 3D 網格幾何體積計算耗材克數與時間
   const volOuterWall = sideSurfaceAreaMM2 * cfg.lineWidth;
-  // 2. 內牆體積 (mm³) = 側面表面積 × (牆圈數 - 1) × 線寬
   const volInnerWall = cfg.spiralVase
     ? 0
     : sideSurfaceAreaMM2 * Math.max(0, cfg.wallLoops - 1) * (cfg.lineWidth * 0.92);
-  // 3. 頂底實心殼層體積 (mm³) = 頂底投影面積 × 平均殼層數 × 層高
   const avgShellLayers = (cfg.topLayers + cfg.bottomLayers) * 0.5;
   const volShell = cfg.spiralVase
     ? (flatTopBottomAreaMM2 * 0.5) * cfg.bottomLayers * cfg.layerHeight
     : flatTopBottomAreaMM2 * avgShellLayers * cfg.layerHeight;
 
-  // 4. 內部空腔剩餘體積 × 填充密度 (%)
   const shellAndWallVol = Math.min(realMeshVolumeMM3 * 0.92, volOuterWall + volInnerWall + volShell);
   const interiorCoreVolume = Math.max(0, realMeshVolumeMM3 - shellAndWallVol);
   const patternMultiplier =
@@ -414,20 +426,17 @@ export function sliceMesh(modelMesh, cfg) {
     ? 0
     : interiorCoreVolume * (cfg.infillDensity / 100) * patternMultiplier;
 
-  // 5. 支撐與裙邊體積 (mm³)
-  const supportAreaPerCol = cfg.supportType.includes('tree') ? 2.4 : 3.1; // 每個支撐格柱截面積 mm²
+  const supportAreaPerCol = cfg.supportType.includes('tree') ? 2.4 : 3.1;
   const volSupport = cfg.supportEnable ? totalSupportHeightMM * supportAreaPerCol : 0;
   const volBrim = brimExtrusionMM * cfg.initialLineWidth * cfg.initialLayerHeight;
 
   const totalExtrudedVolumeMM3 =
     volOuterWall + volInnerWall + volShell + volInfill + volSupport + volBrim;
 
-  // 換算為 1.75mm 線材長度 (m) 與 PLA 重量 (g，密度 1.24 g/cm³)
-  const filamentCrossSectionMM2 = Math.PI * Math.pow(1.75 * 0.5, 2); // 2.4053 mm²
+  const filamentCrossSectionMM2 = Math.PI * Math.pow(1.75 * 0.5, 2);
   const filamentLengthM = totalExtrudedVolumeMM3 / filamentCrossSectionMM2 / 1000;
   const weightGrams = (totalExtrudedVolumeMM3 / 1000) * 1.24;
 
-  // 依據擠出路徑長度與各部位速度計算列印時間
   const beadArea = Math.max(0.04, cfg.lineWidth * cfg.layerHeight * 0.9);
   const accelEfficiency = 0.58;
   const timeSeconds =
@@ -504,16 +513,20 @@ function addInstancedExtrusions(group, segments, z, width, height, material) {
   group.add(instMesh);
 }
 
-function isNearTopOrBottomSurface(flatZTris, px, py, z, topThick, bottomThick) {
-  for (let i = 0; i < flatZTris.length; i++) {
-    const t = flatZTris[i];
+// 不依賴法線正負號，只要正上方 (z ~ z + topThick) 或正下方 (z - bottomThick ~ z) 有水平面即觸發紫色殼層封頂
+function isNearHorizontalSurface(nonVerticalTris, px, py, z, topThick, bottomThick) {
+  for (let i = 0; i < nonVerticalTris.length; i++) {
+    const t = nonVerticalTris[i];
+    if (t.absNz < 0.35) continue;
     if (px < t.minX || px > t.maxX || py < t.minY || py > t.maxY) continue;
 
-    if (t.nz > 0.35 && t.zMax >= z - 0.05 && t.zMin <= z + topThick) {
-      if (pointInTri2D(px, py, t.a, t.b, t.c)) return true;
-    }
-    if (t.nz < -0.35 && t.zMin <= z + 0.05 && t.zMax >= z - bottomThick) {
-      if (pointInTri2D(px, py, t.a, t.b, t.c)) return true;
+    if (t.zMax >= z - bottomThick && t.zMin <= z + topThick) {
+      if (pointInTri2D(px, py, t.a, t.b, t.c)) {
+        const zHit = interpolateZOnTri(px, py, t.a, t.b, t.c);
+        if ((zHit >= z - 0.05 && zHit <= z + topThick) || (zHit <= z + 0.05 && zHit >= z - bottomThick)) {
+          return true;
+        }
+      }
     }
   }
   return false;

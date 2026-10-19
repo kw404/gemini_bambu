@@ -8,7 +8,6 @@ const PATTERN_LABELS = {
   rectilinear: '直線 (Rectilinear)'
 };
 
-// 共用單位方塊幾何體，供 InstancedMesh 高速渲染所有立體膠條
 const UNIT_EXTRUSION_GEO = new THREE.BoxGeometry(1, 1, 1);
 
 export function sliceMesh(modelMesh, cfg) {
@@ -30,8 +29,8 @@ export function sliceMesh(modelMesh, cfg) {
   const cb = new THREE.Vector3();
   const ab = new THREE.Vector3();
 
-  const overhangPoints = [];
-  const cosThreshold = Math.cos(((90 - cfg.supportAngle) * Math.PI) / 180);
+  // 判斷懸空角度：水平懸空面法向量 nz = -1，當 nz < -sin(thresholdAngle) 時需要支撐
+  const supportNzLimit = -Math.sin((Math.max(5, cfg.supportAngle) * Math.PI) / 180);
 
   for (let i = 0; i < triCount; i++) {
     vA.fromBufferAttribute(posAttr, i * 3).applyMatrix4(matrix);
@@ -66,13 +65,59 @@ export function sliceMesh(modelMesh, cfg) {
     if (Math.abs(cb.z) > 0.35) {
       flatZTris.push(triObj);
     }
+  }
 
-    if (cfg.supportEnable && zMin > 1.5 && cb.z < -cosThreshold) {
-      overhangPoints.push({
-        x: (vA.x + vB.x + vC.x) / 3,
-        y: (vA.y + vB.y + vC.y) / 3,
-        z: (vA.z + vB.z + vC.z) / 3
-      });
+  // ============================================================================
+  // 真實 2D 網格垂直射線支撐偵測 (Raycasting Support Columns)
+  // ============================================================================
+  const supportSpans = [];
+  if (cfg.supportEnable && isFinite(box.min.x)) {
+    const gridStep = 3.6; // 支撐柱格點間距 (mm)
+    for (let gx = box.min.x + 1.5; gx <= box.max.x - 1.5; gx += gridStep) {
+      for (let gy = box.min.y + 1.5; gy <= box.max.y - 1.5; gy += gridStep) {
+        // 收集通過 (gx, gy) 的所有頂面與底面交點
+        const hits = [];
+        for (let i = 0; i < flatZTris.length; i++) {
+          const t = flatZTris[i];
+          if (gx < t.minX || gx > t.maxX || gy < t.minY || gy > t.maxY) continue;
+          if (pointInTri2D(gx, gy, t.a, t.b, t.c)) {
+            const zHit = interpolateZOnTri(gx, gy, t.a, t.b, t.c);
+            hits.push({ z: zHit, nz: t.nz });
+          }
+        }
+        if (hits.length === 0) continue;
+
+        // 依高度由低到高排序並去除重疊面
+        hits.sort((a, b) => a.z - b.z);
+
+        for (let h = 0; h < hits.length; h++) {
+          const hit = hits[h];
+          // 若是朝下的懸空面 (nz <= supportNzLimit) 且距離底部超過 1.2mm
+          if (hit.nz <= supportNzLimit && hit.z > 1.2) {
+            // 往下方尋找最近的一個朝上模型頂面 (nz > 0.2)
+            let zBase = 0;
+            for (let k = h - 1; k >= 0; k--) {
+              if (hits[k].nz > 0.2 && hits[k].z < hit.z - 0.8) {
+                zBase = hits[k].z;
+                break;
+              }
+            }
+
+            // 檢查這個區間中點是否誤處於其他疊加方塊的內部
+            if (hit.z - zBase > 1.2) {
+              // 若勾選「僅在列印板生成」，則只允許 zBase 接近 0 (熱床) 的支撐柱
+              if (cfg.supportBuildPlateOnly && zBase > 0.6) continue;
+
+              supportSpans.push({
+                x: gx,
+                y: gy,
+                zBottom: zBase,
+                zTop: hit.z
+              });
+            }
+          }
+        }
+      }
     }
   }
 
@@ -97,23 +142,11 @@ export function sliceMesh(modelMesh, cfg) {
   const matSupport = new THREE.MeshStandardMaterial({ color: 0x23d160, ...matConfig });
   const matBrim = new THREE.MeshStandardMaterial({ color: 0x2b8cff, ...matConfig });
 
-  const supportColumns = new Map();
-  if (cfg.supportEnable && overhangPoints.length > 0) {
-    for (const pt of overhangPoints) {
-      const gx = Math.round(pt.x / 4.5) * 4.5;
-      const gy = Math.round(pt.y / 4.5) * 4.5;
-      const key = `${gx},${gy}`;
-      if (!supportColumns.has(key) || supportColumns.get(key).z < pt.z) {
-        supportColumns.set(key, { x: gx, y: gy, z: pt.z });
-      }
-    }
-  }
-
   let totalExtrusionLengthMM = 0;
+  let supportExtrusionLengthMM = 0;
   const topShellThicknessZ = cfg.topLayers * cfg.layerHeight + 0.05;
   const bottomShellThicknessZ = cfg.bottomLayers * cfg.layerHeight + 0.05;
 
-  // 依據真實物理密度公式計算基礎間距 (15% 約為 5.2mm 間距，蜂巢半徑約 3.2mm)
   const densityRatio = Math.max(0.02, Math.min(0.98, cfg.infillDensity / 100));
   const realInfillSpacing = Math.max(cfg.lineWidth * 1.3, (cfg.lineWidth * 1.95) / densityRatio);
 
@@ -213,7 +246,6 @@ export function sliceMesh(modelMesh, cfg) {
           outerVertsForClip, minX, maxX, minY, maxY, shellStep, shellAngle, wallInset, shellSegments
         );
       } else {
-        // 檢查局部階梯頂面／底面封頂
         const localShellCandidates = [];
         generateRotatedHatchSegments(
           outerVertsForClip, minX, maxX, minY, maxY, shellStep, shellAngle, wallInset, localShellCandidates
@@ -239,7 +271,6 @@ export function sliceMesh(modelMesh, cfg) {
           }
         }
 
-        // 生成真實密度的稀疏填充
         if (cfg.infillDensity > 0) {
           const rawInfill = [];
           generatePatternInfillSegments(
@@ -268,21 +299,63 @@ export function sliceMesh(modelMesh, cfg) {
       }
     }
 
-    // 4. 支撐結構
-    if (cfg.supportEnable && supportColumns.size > 0) {
-      const isTree = cfg.supportType.includes('tree');
-      supportColumns.forEach((col) => {
-        if (z < col.z - cfg.layerHeight) {
-          const r = isTree ? 1.7 * (1 - (z / col.z) * 0.35) : 1.5;
-          supportSegments.push(
-            { x1: col.x - r, y1: col.y - r, x2: col.x + r, y2: col.y - r },
-            { x1: col.x + r, y1: col.y - r, x2: col.x + r, y2: col.y + r },
-            { x1: col.x + r, y1: col.y + r, x2: col.x - r, y2: col.y + r },
-            { x1: col.x - r, y1: col.y + r, x2: col.x - r, y2: col.y - r }
-          );
-          totalExtrusionLengthMM += r * 8;
+    // 4. 生成支撐結構（普通方格柱狀 Normal vs 樹狀有機圓環分支 Tree）
+    if (cfg.supportEnable && supportSpans.length > 0) {
+      const isTree = cfg.supportType.includes('tree') || cfg.supportStyle === 'organic';
+
+      for (let s = 0; s < supportSpans.length; s++) {
+        const sp = supportSpans[s];
+        if (z > sp.zBottom + 0.05 && z < sp.zTop - cfg.layerHeight * 0.6) {
+          // 確保支撐點不會畫進該層已經存在的模型實體多邊形內
+          if (outerVertsForClip.length > 0 && isPointInPolygon(outerVertsForClip, sp.x, sp.y)) {
+            continue;
+          }
+
+          const progress = (z - sp.zBottom) / Math.max(1, sp.zTop - sp.zBottom);
+
+          if (isTree) {
+            // 樹狀支撐：底部粗、往上漸細並略微向中心聚攏的八角形樹幹
+            const radius = 1.9 * (1 - progress * 0.42);
+            const trunkShiftX = Math.sin(progress * Math.PI) * 0.6;
+            const cx = sp.x + trunkShiftX;
+            const cy = sp.y;
+            const sides = 6;
+            for (let k = 0; k < sides; k++) {
+              const a1 = (k * 2 * Math.PI) / sides;
+              const a2 = ((k + 1) * 2 * Math.PI) / sides;
+              supportSegments.push({
+                x1: cx + radius * Math.cos(a1),
+                y1: cy + radius * Math.sin(a1),
+                x2: cx + radius * Math.cos(a2),
+                y2: cy + radius * Math.sin(a2)
+              });
+            }
+            supportExtrusionLengthMM += radius * 6;
+          } else {
+            // 普通支撐 (Normal)：蛇行波浪折線支撐牆 + 頂部接觸介面層
+            const r = 1.55;
+            const isInterfaceLayer = z > sp.zTop - cfg.layerHeight * 3.2;
+            if (isInterfaceLayer) {
+              // 支撐頂部接觸層（密集格線）
+              supportSegments.push(
+                { x1: sp.x - r, y1: sp.y - r, x2: sp.x + r, y2: sp.y - r },
+                { x1: sp.x - r, y1: sp.y, x2: sp.x + r, y2: sp.y },
+                { x1: sp.x - r, y1: sp.y + r, x2: sp.x + r, y2: sp.y + r }
+              );
+            } else {
+              // 普通支撐主體（方柱加對角支撐肋）
+              supportSegments.push(
+                { x1: sp.x - r, y1: sp.y - r, x2: sp.x + r, y2: sp.y - r },
+                { x1: sp.x + r, y1: sp.y - r, x2: sp.x + r, y2: sp.y + r },
+                { x1: sp.x + r, y1: sp.y + r, x2: sp.x - r, y2: sp.y + r },
+                { x1: sp.x - r, y1: sp.y + r, x2: sp.x - r, y2: sp.y - r }
+              );
+            }
+            supportExtrusionLengthMM += r * 8;
+          }
         }
-      });
+      }
+      totalExtrusionLengthMM += supportExtrusionLengthMM;
     }
 
     // 5. 第一層裙邊 (Brim)
@@ -307,7 +380,7 @@ export function sliceMesh(modelMesh, cfg) {
     addInstancedExtrusions(layerObj, innerSegments, z, cfg.lineWidth * 0.9, h, matInnerWall);
     addInstancedExtrusions(layerObj, infillSegments, z, cfg.lineWidth * 0.85, h, matInfill);
     addInstancedExtrusions(layerObj, shellSegments, z, cfg.lineWidth * 0.95, h, matTopBottom);
-    addInstancedExtrusions(layerObj, supportSegments, z, cfg.lineWidth * 0.85, h, matSupport);
+    addInstancedExtrusions(layerObj, supportSegments, z, cfg.lineWidth * 0.88, h, matSupport);
     addInstancedExtrusions(layerObj, brimSegments, z, cfg.initialLineWidth, h, matBrim);
 
     layerGroups.push(layerObj);
@@ -330,8 +403,19 @@ export function sliceMesh(modelMesh, cfg) {
     weightGrams: Math.max(0.5, weightGrams),
     timeSeconds: Math.max(60, timeSeconds),
     patternLabel: PATTERN_LABELS[cfg.infillPattern] || cfg.infillPattern,
+    hasSupportGenerated: supportSpans.length > 0,
     settings: cfg
   };
+}
+
+// 計算平面三角形在 (px, py) 處的精確 Z 高度
+function interpolateZOnTri(px, py, a, b, c) {
+  const det = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+  if (Math.abs(det) < 1e-6) return (a.z + b.z + c.z) / 3;
+  const l1 = ((b.y - c.y) * (px - c.x) + (c.x - b.x) * (py - c.y)) / det;
+  const l2 = ((c.y - a.y) * (px - c.x) + (a.x - c.x) * (py - c.y)) / det;
+  const l3 = 1 - l1 - l2;
+  return l1 * a.z + l2 * b.z + l3 * c.z;
 }
 
 function addInstancedExtrusions(group, segments, z, width, height, material) {
@@ -389,9 +473,6 @@ function pointInTri2D(px, py, a, b, c) {
   return !(hasNeg && hasPos);
 }
 
-// ============================================================================
-// 5 種真實幾何填充圖案產生器 (對應真實密度 % 與嚴格內牆邊界裁切)
-// ============================================================================
 function generatePatternInfillSegments(
   pattern, outerVerts, minX, maxX, minY, maxY, z, lIdx, spacing, wallInset, outSegs
 ) {
@@ -400,7 +481,6 @@ function generatePatternInfillSegments(
   } else if (pattern === 'gyroid') {
     return generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, wallInset, outSegs);
   } else if (pattern === 'triangles') {
-    // 三向交叉：間距乘上 1.5 倍以維持相同體積密度
     const triSpacing = spacing * 1.5;
     let len = 0;
     len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, triSpacing, 0, wallInset, outSegs);
@@ -408,12 +488,10 @@ function generatePatternInfillSegments(
     len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, triSpacing, (2 * Math.PI) / 3, wallInset, outSegs);
     return len;
   } else if (pattern === 'rectilinear') {
-    // 單向每層交替：間距乘上 0.55 倍以符合單層線密度
     const rectSpacing = Math.max(0.6, spacing * 0.55);
     const angle = lIdx % 2 === 0 ? Math.PI / 4 : -Math.PI / 4;
     return generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, rectSpacing, angle, wallInset, outSegs);
   } else {
-    // 雙向網格 (Grid)
     let len = 0;
     len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, Math.PI / 4, wallInset, outSegs);
     len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, -Math.PI / 4, wallInset, outSegs);
@@ -421,10 +499,8 @@ function generatePatternInfillSegments(
   }
 }
 
-// 1. 蜂巢 (Honeycomb)：依照真實密度計算六角形半徑 R，並嚴格裁切於內牆之內
 function generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, wallInset, outSegs) {
   let addedLength = 0;
-  // 在 15% 密度時，spacing 約 5.2mm -> 六角形半徑 R 約 3.4mm（符合 Bambu Studio 視覺比例）
   const R = Math.max(1.2, spacing * 0.65);
   const dx = R * 1.5;
   const dy = R * Math.sqrt(3);
@@ -454,7 +530,6 @@ function generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, 
   return addedLength;
 }
 
-// 2. 陀螺儀 (Gyroid)：隨層高相位變化的雙向正弦波，嚴格限制於內牆內
 function generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, wallInset, outSegs) {
   let addedLength = 0;
   const waveStep = Math.max(1.8, spacing * 0.95);
@@ -493,7 +568,6 @@ function generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, 
   return addedLength;
 }
 
-// 3. 旋轉角度平行掃描線
 function generateRotatedHatchSegments(
   outerVerts, minX, maxX, minY, maxY, spacing, angleRad, insetMargin, outSegs
 ) {
@@ -544,7 +618,6 @@ function generateRotatedHatchSegments(
   return addedLength;
 }
 
-// 將蜂巢邊線細分並嚴格檢查「兩端點＋中點」與外牆距離 >= wallInset，徹底消除刺出外牆的紅線
 function clipSegmentStrictlyInside(outerVerts, x1, y1, x2, y2, wallInset, outSegs) {
   const segLen = Math.hypot(x2 - x1, y2 - y1);
   const subs = Math.max(3, Math.ceil(segLen / 1.2));
@@ -566,7 +639,6 @@ function clipSegmentStrictlyInside(outerVerts, x1, y1, x2, y2, wallInset, outSeg
   return len;
 }
 
-// 確保線段的起點、中點、終點都在多邊形內部，且距離任何一條外牆線段至少 margin (mm)
 function isSegmentStrictlyInside(outerVerts, x1, y1, x2, y2, margin) {
   const mx = (x1 + x2) * 0.5;
   const my = (y1 + y2) * 0.5;

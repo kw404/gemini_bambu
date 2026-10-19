@@ -149,28 +149,30 @@ export function snapMeshToBed(mesh) {
 }
 
 // 建立一體成型（無重疊面）、具備階梯頂面、懸空屋簷與頂部圓柱的教學模型
+// 請替換 js/scene.js 底部的 createDemoGeometry 函式：
 export function createDemoGeometry() {
   const geometries = [];
 
-  // 第 1 層大底盤：Z = 0 ~ 10 mm (60 x 46 x 10)
-  const step1 = new THREE.BoxGeometry(60, 46, 10);
-  step1.translate(0, 0, 5);
+  // 第 1 層大底盤：X = -30 ~ +22, Z = 0 ~ 10 mm (52 x 46 x 10)
+  const step1 = new THREE.BoxGeometry(52, 46, 10);
+  step1.translate(-4, 0, 5);
   geometries.push(step1);
 
-  // 第 2 層階梯：Z = 10 ~ 20 mm (36 x 46 x 10)，右側留出 Z=10mm 的水平階梯頂面！
-  const step2 = new THREE.BoxGeometry(36, 46, 10);
-  step2.translate(-12, 0, 15);
+  // 第 2 層階梯：X = -30 ~ +4, Z = 10 ~ 20 mm (34 x 46 x 10)，右側留出 Z=10mm 的階梯平台
+  const step2 = new THREE.BoxGeometry(34, 46, 10);
+  step2.translate(-13, 0, 15);
   geometries.push(step2);
 
-  // 第 3 層懸空屋頂：Z = 20 ~ 26 mm (54 x 34 x 6)，向右懸空突出 18mm 用於練習支撐！
-  const roof = new THREE.BoxGeometry(54, 34, 6);
-  roof.translate(-3, 0, 23);
+  // 第 3 層懸空屋頂：X = -30 ~ +36, Z = 20 ~ 26 mm (66 x 32 x 6)
+  // 其中 X = +4 ~ +22 懸空在第一階平台上；X = +22 ~ +36 則完全懸空在 PEI 熱床上方！
+  const roof = new THREE.BoxGeometry(66, 32, 6);
+  roof.translate(3, 0, 23);
   geometries.push(roof);
 
   // 第 4 層頂部圓柱：Z = 26 ~ 34 mm (半徑 9mm，高 8mm)
   const cyl = new THREE.CylinderGeometry(9, 9, 8, 32);
   cyl.rotateX(Math.PI / 2);
-  cyl.translate(-12, 0, 30);
+  cyl.translate(-13, 0, 30);
   geometries.push(cyl);
 
   const positions = [];

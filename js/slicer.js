@@ -8,7 +8,7 @@ const PATTERN_LABELS = {
   rectilinear: '直線 (Rectilinear)'
 };
 
-// 共用單位方塊幾何體（中心在 0,0,0，長寬高皆為 1），供 InstancedMesh 高速渲染所有立體膠條
+// 共用單位方塊幾何體，供 InstancedMesh 高速渲染所有立體膠條
 const UNIT_EXTRUSION_GEO = new THREE.BoxGeometry(1, 1, 1);
 
 export function sliceMesh(modelMesh, cfg) {
@@ -21,7 +21,7 @@ export function sliceMesh(modelMesh, cfg) {
 
   const triCount = Math.floor(posAttr.count / 3);
   const tris = [];
-  const flatZTris = []; // 專門收集接近水平的頂面/底面三角形，用於判斷每個階梯的封頂與封底！
+  const flatZTris = [];
   const box = new THREE.Box3();
 
   const vA = new THREE.Vector3();
@@ -63,12 +63,10 @@ export function sliceMesh(modelMesh, cfg) {
     };
     tris.push(triObj);
 
-    // 若法向量 Z 分量絕對值 > 0.35，代表是頂面、底面或斜面，納入封頂/封底投影檢測
     if (Math.abs(cb.z) > 0.35) {
       flatZTris.push(triObj);
     }
 
-    // 偵測懸空面以生成支撐
     if (cfg.supportEnable && zMin > 1.5 && cb.z < -cosThreshold) {
       overhangPoints.push({
         x: (vA.x + vB.x + vC.x) / 3,
@@ -78,7 +76,6 @@ export function sliceMesh(modelMesh, cfg) {
     }
   }
 
-  // 計算各層切片 Z 座標（避開整數邊界 0.003mm，防止切平面剛好貼在水平階梯面上產生重疊）
   const maxZ = Math.max(0.4, box.max.z);
   const layerZs = [];
   let currentZ = cfg.initialLayerHeight;
@@ -92,7 +89,6 @@ export function sliceMesh(modelMesh, cfg) {
   const previewGroup = new THREE.Group();
   const layerGroups = [];
 
-  // Bambu Studio 標準材質（具備立體光澤）
   const matConfig = { roughness: 0.35, metalness: 0.08 };
   const matOuterWall = new THREE.MeshStandardMaterial({ color: 0xff7b24, ...matConfig });
   const matInnerWall = new THREE.MeshStandardMaterial({ color: 0xffd026, ...matConfig });
@@ -101,7 +97,6 @@ export function sliceMesh(modelMesh, cfg) {
   const matSupport = new THREE.MeshStandardMaterial({ color: 0x23d160, ...matConfig });
   const matBrim = new THREE.MeshStandardMaterial({ color: 0x2b8cff, ...matConfig });
 
-  // 支撐柱格點合併
   const supportColumns = new Map();
   if (cfg.supportEnable && overhangPoints.length > 0) {
     for (const pt of overhangPoints) {
@@ -118,10 +113,13 @@ export function sliceMesh(modelMesh, cfg) {
   const topShellThicknessZ = cfg.topLayers * cfg.layerHeight + 0.05;
   const bottomShellThicknessZ = cfg.bottomLayers * cfg.layerHeight + 0.05;
 
-  // 逐層切片
+  // 依據真實物理密度公式計算基礎間距 (15% 約為 5.2mm 間距，蜂巢半徑約 3.2mm)
+  const densityRatio = Math.max(0.02, Math.min(0.98, cfg.infillDensity / 100));
+  const realInfillSpacing = Math.max(cfg.lineWidth * 1.3, (cfg.lineWidth * 1.95) / densityRatio);
+
   for (let lIdx = 0; lIdx < totalLayers; lIdx++) {
     const z = layerZs[lIdx];
-    const zSafe = z + 0.0037; // 微調避開整數高度奇異點
+    const zSafe = z + 0.0037;
     const layerObj = new THREE.Group();
 
     const outerSegments = [];
@@ -135,7 +133,7 @@ export function sliceMesh(modelMesh, cfg) {
     let minY = Infinity, maxY = -Infinity;
     let segCount = 0;
 
-    // 1. 取得該層所有三角形與 Z 平面的交線（外牆）
+    // 1. 外牆交線
     for (let t = 0; t < tris.length; t++) {
       const tri = tris[t];
       if (zSafe < tri.zMin || zSafe > tri.zMax) continue;
@@ -151,8 +149,8 @@ export function sliceMesh(modelMesh, cfg) {
           y1: p1.y,
           x2: p2.x,
           y2: p2.y,
-          nx: tri.a ? -(p2.y - p1.y) / segLen : 0,
-          ny: tri.a ? (p2.x - p1.x) / segLen : 0
+          nx: -(p2.y - p1.y) / segLen,
+          ny: (p2.x - p1.x) / segLen
         });
         totalExtrusionLengthMM += segLen * cfg.wallLoops;
 
@@ -169,15 +167,14 @@ export function sliceMesh(modelMesh, cfg) {
       outerVertsForClip.push(s.x1, s.y1, z, s.x2, s.y2, z);
     }
 
-    // 2. 產生內牆（沿各線段法線向模型內部偏移，支援任意凹多邊形與多連通區域）
+    // 2. 內牆圈數
     if (!cfg.spiralVase && cfg.wallLoops > 1 && outerSegments.length > 0) {
       const loops = Math.min(cfg.wallLoops - 1, 5);
       for (let w = 1; w <= loops; w++) {
-        const offsetDist = w * (cfg.lineWidth * 0.95);
+        const offsetDist = w * (cfg.lineWidth * 0.92);
         for (const seg of outerSegments) {
           const mx = (seg.x1 + seg.x2) * 0.5;
           const my = (seg.y1 + seg.y2) * 0.5;
-          // 判斷法線哪一側在多邊形內部
           const testX = mx + seg.nx * 0.3;
           const testY = my + seg.ny * 0.3;
           const dir = isPointInPolygon(outerVertsForClip, testX, testY) ? 1 : -1;
@@ -185,7 +182,6 @@ export function sliceMesh(modelMesh, cfg) {
           const ox = seg.nx * offsetDist * dir;
           const oy = seg.ny * offsetDist * dir;
 
-          // 退縮兩端點避免轉角突出模型外
           const dx = seg.x2 - seg.x1;
           const dy = seg.y2 - seg.y1;
           const len = Math.hypot(dx, dy);
@@ -196,38 +192,36 @@ export function sliceMesh(modelMesh, cfg) {
           const sx2 = seg.x2 - dx * shrink + ox;
           const sy2 = seg.y2 - dy * shrink + oy;
 
-          if (isPointInPolygon(outerVertsForClip, (sx1 + sx2) * 0.5, (sy1 + sy2) * 0.5)) {
+          if (isSegmentStrictlyInside(outerVertsForClip, sx1, sy1, sx2, sy2, 0.15)) {
             innerSegments.push({ x1: sx1, y1: sy1, x2: sx2, y2: sy2 });
           }
         }
       }
     }
 
-    // 3. 內部區域：自動分辨「局部頂底封頂殼層（紫色）」與「內部稀疏填充（紅色）」
+    // 3. 頂底封頂殼層 vs 內部稀疏填充
     const isGlobalBottomOrTop =
       !cfg.spiralVase && (lIdx < cfg.bottomLayers || lIdx >= totalLayers - cfg.topLayers);
 
     if (segCount > 0 && isFinite(minX) && !cfg.spiralVase) {
-      const wallInset = cfg.wallLoops * cfg.lineWidth * 0.9;
-      const shellStep = cfg.lineWidth * 1.45;
+      const wallInset = cfg.wallLoops * cfg.lineWidth * 0.95;
+      const shellStep = cfg.lineWidth * 1.4;
       const shellAngle = lIdx % 2 === 0 ? Math.PI / 4 : -Math.PI / 4;
 
       if (isGlobalBottomOrTop) {
-        // 整體最底層與最頂層：全區實心紫色封頂
         totalExtrusionLengthMM += generateRotatedHatchSegments(
           outerVertsForClip, minX, maxX, minY, maxY, shellStep, shellAngle, wallInset, shellSegments
         );
       } else {
-        // 中間層：檢查是否有「局部階梯頂面／懸空底面」需要紫色封頂！
+        // 檢查局部階梯頂面／底面封頂
         const localShellCandidates = [];
         generateRotatedHatchSegments(
           outerVertsForClip, minX, maxX, minY, maxY, shellStep, shellAngle, wallInset, localShellCandidates
         );
 
-        // 將局部掃描線切分為小段，若正上方或正下方有水平面（距離 <= 頂底殼層厚度），就封頂為紫色殼層！
         for (const cand of localShellCandidates) {
           const length = Math.hypot(cand.x2 - cand.x1, cand.y2 - cand.y1);
-          const steps = Math.max(1, Math.ceil(length / 3.0));
+          const steps = Math.max(1, Math.ceil(length / 2.8));
           for (let s = 0; s < steps; s++) {
             const t0 = s / steps;
             const t1 = (s + 1) / steps;
@@ -245,9 +239,8 @@ export function sliceMesh(modelMesh, cfg) {
           }
         }
 
-        // 其餘真正位於模型內部的空間：生成選定的稀疏填充圖案（蜂巢／陀螺儀／網格等）
+        // 生成真實密度的稀疏填充
         if (cfg.infillDensity > 0) {
-          const spacing = Math.max(2.4, 22 * (1 - cfg.infillDensity / 112));
           const rawInfill = [];
           generatePatternInfillSegments(
             cfg.infillPattern,
@@ -258,12 +251,11 @@ export function sliceMesh(modelMesh, cfg) {
             maxY,
             z,
             lIdx,
-            spacing,
+            realInfillSpacing,
             wallInset,
             rawInfill
           );
 
-          // 過濾掉已經鋪了紫色局部封頂的區域，避免紅紫重疊
           for (const seg of rawInfill) {
             const mx = (seg.x1 + seg.x2) * 0.5;
             const my = (seg.y1 + seg.y2) * 0.5;
@@ -310,7 +302,6 @@ export function sliceMesh(modelMesh, cfg) {
       }
     }
 
-    // 使用 InstancedMesh 繪製所有具有真實寬度與層高厚度的 3D 擠出膠條
     const h = cfg.layerHeight * 0.92;
     addInstancedExtrusions(layerObj, outerSegments, z, cfg.lineWidth, h, matOuterWall);
     addInstancedExtrusions(layerObj, innerSegments, z, cfg.lineWidth * 0.9, h, matInnerWall);
@@ -343,7 +334,6 @@ export function sliceMesh(modelMesh, cfg) {
   };
 }
 
-// 使用 THREE.InstancedMesh 零破圖、高速建立 3D 立體擠出線條
 function addInstancedExtrusions(group, segments, z, width, height, material) {
   if (!segments || segments.length === 0) return;
 
@@ -366,8 +356,7 @@ function addInstancedExtrusions(group, segments, z, width, height, material) {
 
     dummy.position.set(mx, my, zCenter);
     dummy.rotation.set(0, 0, angle);
-    // 長度稍微加寬 0.15mm 讓線段轉角處自然接合不留縫隙
-    dummy.scale.set(seg.len + width * 0.35, width, height);
+    dummy.scale.set(seg.len + width * 0.2, width, height);
     dummy.updateMatrix();
     instMesh.setMatrixAt(i, dummy.matrix);
   }
@@ -376,17 +365,14 @@ function addInstancedExtrusions(group, segments, z, width, height, material) {
   group.add(instMesh);
 }
 
-// 檢查點 (px, py, z) 正上方或正下方是否緊鄰模型的水平/傾斜頂面或底面（解決階梯平台沒封頂問題）
 function isNearTopOrBottomSurface(flatZTris, px, py, z, topThick, bottomThick) {
   for (let i = 0; i < flatZTris.length; i++) {
     const t = flatZTris[i];
     if (px < t.minX || px > t.maxX || py < t.minY || py > t.maxY) continue;
 
-    // 檢查是否為正上方的頂蓋面 (nz > 0.35)
     if (t.nz > 0.35 && t.zMax >= z - 0.05 && t.zMin <= z + topThick) {
       if (pointInTri2D(px, py, t.a, t.b, t.c)) return true;
     }
-    // 檢查是否為正下方的底面 (nz < -0.35)
     if (t.nz < -0.35 && t.zMin <= z + 0.05 && t.zMax >= z - bottomThick) {
       if (pointInTri2D(px, py, t.a, t.b, t.c)) return true;
     }
@@ -404,35 +390,42 @@ function pointInTri2D(px, py, a, b, c) {
 }
 
 // ============================================================================
-// 5 種真實幾何填充圖案產生器
+// 5 種真實幾何填充圖案產生器 (對應真實密度 % 與嚴格內牆邊界裁切)
 // ============================================================================
 function generatePatternInfillSegments(
   pattern, outerVerts, minX, maxX, minY, maxY, z, lIdx, spacing, wallInset, outSegs
 ) {
   if (pattern === 'honeycomb') {
-    return generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, outSegs);
+    return generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, wallInset, outSegs);
   } else if (pattern === 'gyroid') {
-    return generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, outSegs);
+    return generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, wallInset, outSegs);
   } else if (pattern === 'triangles') {
+    // 三向交叉：間距乘上 1.5 倍以維持相同體積密度
+    const triSpacing = spacing * 1.5;
     let len = 0;
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 1.15, 0, wallInset, outSegs);
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 1.15, Math.PI / 3, wallInset, outSegs);
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 1.15, (2 * Math.PI) / 3, wallInset, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, triSpacing, 0, wallInset, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, triSpacing, Math.PI / 3, wallInset, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, triSpacing, (2 * Math.PI) / 3, wallInset, outSegs);
     return len;
   } else if (pattern === 'rectilinear') {
+    // 單向每層交替：間距乘上 0.55 倍以符合單層線密度
+    const rectSpacing = Math.max(0.6, spacing * 0.55);
     const angle = lIdx % 2 === 0 ? Math.PI / 4 : -Math.PI / 4;
-    return generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing * 0.85, angle, wallInset, outSegs);
+    return generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, rectSpacing, angle, wallInset, outSegs);
   } else {
+    // 雙向網格 (Grid)
     let len = 0;
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, 0, wallInset, outSegs);
-    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, Math.PI / 2, wallInset, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, Math.PI / 4, wallInset, outSegs);
+    len += generateRotatedHatchSegments(outerVerts, minX, maxX, minY, maxY, spacing, -Math.PI / 4, wallInset, outSegs);
     return len;
   }
 }
 
-function generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, outSegs) {
+// 1. 蜂巢 (Honeycomb)：依照真實密度計算六角形半徑 R，並嚴格裁切於內牆之內
+function generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, wallInset, outSegs) {
   let addedLength = 0;
-  const R = Math.max(2.2, spacing * 0.65);
+  // 在 15% 密度時，spacing 約 5.2mm -> 六角形半徑 R 約 3.4mm（符合 Bambu Studio 視覺比例）
+  const R = Math.max(1.2, spacing * 0.65);
   const dx = R * 1.5;
   const dy = R * Math.sqrt(3);
 
@@ -454,29 +447,28 @@ function generateHoneycombSegments(outerVerts, minX, maxX, minY, maxY, spacing, 
       for (let k = 0; k < 3; k++) {
         const p1 = hexCorners[k];
         const p2 = hexCorners[(k + 1) % 6];
-        addedLength += clipSubdividedSegmentToSegments(outerVerts, p1.x, p1.y, p2.x, p2.y, outSegs);
+        addedLength += clipSegmentStrictlyInside(outerVerts, p1.x, p1.y, p2.x, p2.y, wallInset, outSegs);
       }
     }
   }
   return addedLength;
 }
 
-function generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, outSegs) {
+// 2. 陀螺儀 (Gyroid)：隨層高相位變化的雙向正弦波，嚴格限制於內牆內
+function generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, wallInset, outSegs) {
   let addedLength = 0;
-  const waveStep = Math.max(2.6, spacing * 0.95);
+  const waveStep = Math.max(1.8, spacing * 0.95);
   const amp = waveStep * 0.36;
   const freq = (2 * Math.PI) / (waveStep * 2.2);
   const phaseZ = z * 0.65;
-  const segStep = 1.8;
+  const segStep = Math.max(0.8, Math.min(1.6, waveStep * 0.3));
 
   for (let baseY = minY; baseY <= maxY; baseY += waveStep) {
     let prevX = minX;
     let prevY = baseY + Math.sin(prevX * freq + phaseZ) * amp;
     for (let x = minX + segStep; x <= maxX; x += segStep) {
       const curY = baseY + Math.sin(x * freq + phaseZ) * amp;
-      const mx = (prevX + x) * 0.5;
-      const my = (prevY + curY) * 0.5;
-      if (isPointInPolygon(outerVerts, mx, my)) {
+      if (isSegmentStrictlyInside(outerVerts, prevX, prevY, x, curY, wallInset)) {
         outSegs.push({ x1: prevX, y1: prevY, x2: x, y2: curY });
         addedLength += Math.hypot(x - prevX, curY - prevY);
       }
@@ -490,9 +482,7 @@ function generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, 
     let prevX = baseX + Math.cos(prevY * freq - phaseZ) * amp;
     for (let y = minY + segStep; y <= maxY; y += segStep) {
       const curX = baseX + Math.cos(y * freq - phaseZ) * amp;
-      const mx = (prevX + curX) * 0.5;
-      const my = (prevY + y) * 0.5;
-      if (isPointInPolygon(outerVerts, mx, my)) {
+      if (isSegmentStrictlyInside(outerVerts, prevX, prevY, curX, y, wallInset)) {
         outSegs.push({ x1: prevX, y1: prevY, x2: curX, y2: y });
         addedLength += Math.hypot(curX - prevX, y - prevY);
       }
@@ -503,6 +493,7 @@ function generateGyroidSegments(outerVerts, minX, maxX, minY, maxY, z, spacing, 
   return addedLength;
 }
 
+// 3. 旋轉角度平行掃描線
 function generateRotatedHatchSegments(
   outerVerts, minX, maxX, minY, maxY, spacing, angleRad, insetMargin, outSegs
 ) {
@@ -553,9 +544,12 @@ function generateRotatedHatchSegments(
   return addedLength;
 }
 
-function clipSubdividedSegmentToSegments(outerVerts, x1, y1, x2, y2, outSegs) {
-  const subs = 3;
+// 將蜂巢邊線細分並嚴格檢查「兩端點＋中點」與外牆距離 >= wallInset，徹底消除刺出外牆的紅線
+function clipSegmentStrictlyInside(outerVerts, x1, y1, x2, y2, wallInset, outSegs) {
+  const segLen = Math.hypot(x2 - x1, y2 - y1);
+  const subs = Math.max(3, Math.ceil(segLen / 1.2));
   let len = 0;
+
   for (let s = 0; s < subs; s++) {
     const t0 = s / subs;
     const t1 = (s + 1) / subs;
@@ -563,15 +557,45 @@ function clipSubdividedSegmentToSegments(outerVerts, x1, y1, x2, y2, outSegs) {
     const sy0 = y1 + (y2 - y1) * t0;
     const sx1 = x1 + (x2 - x1) * t1;
     const sy1 = y1 + (y2 - y1) * t1;
-    const mx = (sx0 + sx1) * 0.5;
-    const my = (sy0 + sy1) * 0.5;
 
-    if (isPointInPolygon(outerVerts, mx, my)) {
+    if (isSegmentStrictlyInside(outerVerts, sx0, sy0, sx1, sy1, wallInset)) {
       outSegs.push({ x1: sx0, y1: sy0, x2: sx1, y2: sy1 });
       len += Math.hypot(sx1 - sx0, sy1 - sy0);
     }
   }
   return len;
+}
+
+// 確保線段的起點、中點、終點都在多邊形內部，且距離任何一條外牆線段至少 margin (mm)
+function isSegmentStrictlyInside(outerVerts, x1, y1, x2, y2, margin) {
+  const mx = (x1 + x2) * 0.5;
+  const my = (y1 + y2) * 0.5;
+
+  if (!isPointInPolygon(outerVerts, mx, my)) return false;
+  if (!isPointInPolygon(outerVerts, x1, y1)) return false;
+  if (!isPointInPolygon(outerVerts, x2, y2)) return false;
+
+  if (margin > 0) {
+    const mSq = margin * margin * 0.7;
+    for (let i = 0; i < outerVerts.length; i += 6) {
+      const ax = outerVerts[i], ay = outerVerts[i + 1];
+      const bx = outerVerts[i + 3], by = outerVerts[i + 4];
+      if (distToSegmentSq(x1, y1, ax, ay, bx, by) < mSq) return false;
+      if (distToSegmentSq(x2, y2, ax, ay, bx, by) < mSq) return false;
+      if (distToSegmentSq(mx, my, ax, ay, bx, by) < mSq) return false;
+    }
+  }
+  return true;
+}
+
+function distToSegmentSq(px, py, vx, vy, wx, wy) {
+  const l2 = (wx - vx) * (wx - vx) + (wy - vy) * (wy - vy);
+  if (l2 === 0) return (px - vx) * (px - vx) + (py - vy) * (py - vy);
+  let t = ((px - vx) * (wx - vx) + (py - vy) * (wy - vy)) / l2;
+  t = Math.max(0, Math.min(1, t));
+  const projX = vx + t * (wx - vx);
+  const projY = vy + t * (wy - vy);
+  return (px - projX) * (px - projX) + (py - projY) * (py - projY);
 }
 
 function isPointInPolygon(outerVerts, px, py) {
